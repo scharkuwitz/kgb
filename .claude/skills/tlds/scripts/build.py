@@ -354,9 +354,17 @@ class Repo:
                 LOG.add("WARN", f"src/{p.name}", "unreadable survey; anchors are not checked")
                 continue
             d["_edges"] = {(a, b) for a, b, *_ in d.get("module_edges", [])}
+            d["_fedges"] = {(a, b) for a, b, *_ in d.get("file_edges", [])} if "file_edges" in d else None
+            d["_file"] = p.name
             self.surveys.append(d)
             if p.name == "survey.json" or not self.main:
                 self.main = d
+        # a focused survey of another repository would check maps against the wrong code
+        same = lambda d: not d.get("root") or not self.main.get("root") or Path(d["root"]).resolve() == Path(self.main["root"]).resolve()
+        for d in [d for d in self.surveys if not same(d)]:
+            LOG.add("WARN", f"src/{d['_file']}", f"surveys {d['root']}, not {self.main['root']}; ignored. "
+                    "Re-run it with the bundle's repository")
+        self.surveys = [d for d in self.surveys if same(d)]
         if self.main.get("root"):
             self.root = Path(self.main["root"])
             if not self.root.is_dir():
@@ -477,14 +485,32 @@ class Repo:
                     hits.append((i, mid))
         return hits
 
-    def reaches(self, i, a, b):
-        edges = self.surveys[i]["_edges"]
-        seen, todo = set(), [a]
+    def files_named(self, i, name, mid):
+        """The files a graph node stands for in survey i: the file it names, or every file of module mid."""
+        name = plain(name).strip("[]* ").replace("\\", "/")
+        files = self.surveys[i]["modules"][mid].get("files") or []
+        return {name} if name in files else set(files)
+
+    def import_checks(self, i, a, ma, b, mb):
+        """-> (edges, sources, targets) to test a -> b in survey i, or None when it cannot be checked.
+        Nodes in different modules use the module graph; two nodes inside one module use the file graph."""
+        s = self.surveys[i]
+        if ma != mb:
+            return s["_edges"], {ma}, {mb}
+        fa, fb = self.files_named(i, a, ma), self.files_named(i, b, mb)
+        if s["_fedges"] is None or not fa or not fb or fa & fb:
+            return None
+        return s["_fedges"], fa, fb
+
+    @staticmethod
+    def reach(edges, src, dst):
+        """True when a node of src reaches a node of dst along one or more edges."""
+        seen, todo = set(), list(src)
         while todo:
             v = todo.pop()
             for x, y in edges:
                 if x == v and y not in seen:
-                    if y == b:
+                    if y in dst:
                         return True
                     seen.add(y)
                     todo.append(y)
@@ -1304,22 +1330,27 @@ class Page:
             ha, hb = found.get(e["a"]), found.get(e["b"])
             if not ha or not hb or e["style"] == "weak":
                 continue
-            pairs = [(i, ma, mb) for i, ma in ha for j, mb in hb if i == j and ma != mb]
-            direct = any((ma, mb) in repo.surveys[i]["_edges"] for i, ma, mb in pairs)
-            path = any(repo.reaches(i, ma, mb) for i, ma, mb in pairs)
+            checks = [c for i, ma in ha for j, mb in hb if i == j
+                      and (c := repo.import_checks(i, e["a"], ma, e["b"], mb))]
             a, b = plain(e["a"]), plain(e["b"])
+            if not checks:
+                # e.g. a module and one of its own files: the survey cannot settle it either way
+                self.log("NOTE", ln, f"{a} -> {b} is not checked: the survey has no import graph that separates them")
+                continue
+            direct = any((x, y) in edges for edges, src, dst in checks for x in src for y in dst)
+            path = direct or any(repo.reach(edges, src, dst) for edges, src, dst in checks)
             self.quotes += 1
             before = self.verified
             if e["style"] == "never":
                 if path:
-                    self.log("WARN", ln, f"invariant broken: {a} does depend on {b} (directly or through other modules)")
+                    self.log("WARN", ln, f"invariant broken: {a} does depend on {b} (directly or indirectly)")
                 else:
                     self.verified += 1
             elif direct:
                 self.verified += 1
             elif path:
                 self.verified += 1
-                self.log("NOTE", ln, f"{a} reaches {b} only through other modules; fine for a reduced map")
+                self.log("NOTE", ln, f"{a} reaches {b} only indirectly; fine for a reduced map")
             else:
                 self.log("WARN", ln, f"no import from {a} to {b} in the survey; draw it with --> if it is a runtime or data link")
             if self.verified > before and self.sections:

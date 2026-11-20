@@ -52,7 +52,7 @@ A file-by-file tour is a failure, and so is a diagram of everything. The value i
    - for `skip` modules: nothing, unless a claim depends on them;
    - for `unused?` modules: search for dynamic loading (registries, plugins, reflection, string imports, framework conventions) before calling anything dead.
 
-5. **Plan the pages** (craft.md §8). One page for a small repository. Otherwise a start page (`pages/index.md`: the whole map, codemap, Safe to skip, recipes, reading order) plus one page per `read` subsystem, up to `--pages`; run the survey with `--focus <dir>` for each subsystem's own map (it writes `src/survey-<dir>.json`, which the build also uses).
+5. **Plan the pages** (craft.md §8). One page for a small repository. Otherwise a start page (`pages/index.md`: the whole map, codemap, Safe to skip, recipes, reading order) plus one page per `read` subsystem, up to `--pages`; run the survey with `--focus <dir>` for each subsystem's own map (it writes `src/survey-<dir>.json`, which the build also uses). Without a repository argument, a later run on an existing bundle surveys the repository the bundle already covers, including a remote clone.
 
 6. **Write the pages** to `<out>/pages/<slug>.md` with the Write tool, using format.md: lead and infobox, the map (`graph:imports`) with one line per node, interfaces, the trace, invariants, codemap, rationale, hotspots, Safe to skip, recipes, pitfalls, Check yourself. Anchor every claim about behavior to `path:lines`.
 

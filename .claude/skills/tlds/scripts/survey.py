@@ -1117,7 +1117,21 @@ def days(now, t):
     return max(0, int((now - t) // 86400)) if t else None
 
 
+def bundle_root(bundle):
+    """The repository root recorded by the bundle's main survey, or None."""
+    sj = bundle / "src" / "survey.json"
+    try:
+        root = Path(json.loads(sj.read_text(encoding="utf-8"))["root"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return root if root.is_dir() else None
+
+
 def survey(bundle, target, focus_arg, hist_n, top, max_nodes):
+    if target is None and (prev := bundle_root(bundle)):
+        # a later run (--focus) on an existing bundle surveys the same repository, not the current directory
+        print(f"   surveying {prev}, the repository this bundle already covers")
+        target = str(prev)
     root, focus, clone_url = resolve_repo(target, bundle, hist_n)
     focus = (focus_arg.strip("/").replace("\\", "/") if focus_arg else focus) or None
     is_git = git(root, "rev-parse", "--git-dir") is not None
@@ -1527,14 +1541,7 @@ def survey(bundle, target, focus_arg, hist_n, top, max_nodes):
 
 
 def run_outline(bundle, paths):
-    root = None
-    sj = bundle / "src" / "survey.json"
-    if sj.exists():
-        try:
-            root = Path(json.loads(sj.read_text(encoding="utf-8"))["root"])
-        except (ValueError, KeyError):
-            root = None
-    root = root or Path(".").resolve()
+    root = bundle_root(bundle) or Path(".").resolve()
     for p in paths:
         rel = p.replace("\\", "/")
         path = (root / rel) if not Path(rel).is_absolute() else Path(rel)
