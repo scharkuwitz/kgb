@@ -7,3 +7,7 @@ data/probe/
 *.sqlite
 *.sqlite-*
 data/contracts/
+
+# Claude Code: per-machine settings; /tlds output (clones, surveys, rendered pages)
+.claude/settings.local.json
+tlds-out/
