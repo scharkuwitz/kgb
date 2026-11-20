@@ -27,7 +27,6 @@ def load_dotenv(path: Path = ROOT / ".env") -> None:
 
 load_dotenv()
 
-
 def _env(name: str, default) -> str:
     return os.environ.get(name, str(default))
 
