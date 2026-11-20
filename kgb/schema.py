@@ -49,13 +49,19 @@ class TriageResult(BaseModel):
 class Item(BaseModel):
     """One purchasable line: a table row, a product sheet, or a service."""
 
-    name: str = Field(description="Item name exactly as written")
+    name: str = Field(description="Item name exactly as written; empty string if the name cell is empty")
+    continued: bool | None = Field(
+        None,
+        description="true only when this row's empty name or brand cell belongs to a merged cell "
+        "that started on the previous page; otherwise null",
+    )
     code: str | None = Field(None, description="Supplier item code or model number, verbatim")
     brand: str | None = None
     category: str | None = Field(None, description="Section header or product type the item belongs to")
     spec: str | None = Field(None, description="Size, dimensions, color, variant, standard")
     unit: str | None = Field(None, description="Unit of measure, e.g. ш, м, хүн")
-    unit_price: float | None = Field(None, description="Price per unit as a plain number")
+    unit_price: float | None = Field(None, description="Price per unit actually payable (after any discount shown), as a plain number")
+    list_price: float | None = Field(None, description="Price per unit before discount; only when the page shows both")
     currency: str | None = Field(None, description="ISO code, e.g. MNT")
     vat_included: bool | None = None
     search_text: str = Field(

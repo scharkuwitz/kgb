@@ -17,7 +17,14 @@ cp .env.example .env        # then set OPENAI_API_KEY in .env
 uv run python -m kgb.config # prints the active settings; the key shows only as set/MISSING
 ```
 
-All settings are `KGB_*` environment variables (or lines in `.env`): models, data folders, parallel workers, page render size. Defaults are listed in `.env.example`.
+All settings are `KGB_*` environment variables (or lines in `.env`): models, data folders, parallel workers, page render size, image detail for extraction. Defaults are listed in `.env.example`.
+
+## How it works
+
+1. **Load:** every file becomes a list of pages: scans and PDFs as images, office files as text.
+2. **Triage:** one cheap low-resolution pass labels each page, so only pages with items are read closely.
+3. **Extract:** item pages are read in parallel at full resolution into structured entries (name, code, spec, price, VAT, page). Section headers, merged cells and VAT notes are carried across page breaks, and garbled readings are retried.
+4. **Store and search** *(next)*: entries are indexed for keyword and meaning-based search.
 
 ## Usage
 
@@ -27,6 +34,8 @@ Each module can be run on its own as a probe:
 uv run python -m kgb.load "data/contracts/doc.pdf" [out_dir]    # pages, sizes; optionally dump them as images/markdown
 uv run python -m kgb.llm ask "data/contracts/doc.pdf" 6         # label one page with the model (API call)
 uv run python -m kgb.llm embed "first text" "second text"       # embedding shape and similarity (API call)
+uv run python -m kgb.triage "data/contracts/doc.pdf"            # label every page, list the ones to extract (API call)
+uv run python -m kgb.extract "data/contracts/doc.pdf" [pages]   # items as a table + JSON in data/probe/extract (API calls)
 ```
 
 Put source documents in `data/contracts/` (git-ignored). Supported: `pdf`, `png`, `jpg`, `tif`, `webp`, `docx`, `xlsx`, `csv`.
@@ -45,10 +54,12 @@ uv run pytest -q    # offline: no API key or network needed
 | `kgb/schema.py` | Shared data shapes and model output schemas |
 | `kgb/load.py` | Any supported file → list of pages (images or text) |
 | `kgb/llm.py` | The only OpenAI-facing module: structured answers and embeddings |
+| `kgb/triage.py` | Cheap first pass: labels each page as items / key terms / other |
+| `kgb/extract.py` | Item pages → structured items; carries categories, merged cells and VAT across pages |
 
 ## Status
 
-Early development, built in small steps that can each be checked on their own. Done: configuration, document loading, model access. Next: page triage, item extraction, storage, search.
+Early development, built in small steps that can each be checked on their own. Done: configuration, document loading, model access, page triage, item extraction. Next: document facts, storage, search.
 
 ## License
 

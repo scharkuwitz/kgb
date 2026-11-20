@@ -39,18 +39,7 @@ def _data_url(image: bytes, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(image).decode()}"
 
 
-def ask(
-    prompt: str,
-    schema: type[T],
-    images: list[bytes] | None = None,
-    text: str | None = None,
-    model: str = config.EXTRACT_MODEL,
-    mime: str = "image/jpeg",
-) -> T:
-    """One call, strict structured output. `text` (e.g. a docx page) is appended after the prompt."""
-    content: list[dict] = [{"type": "input_text", "text": prompt if text is None else f"{prompt}\n\n{text}"}]
-    for image in images or []:
-        content.append({"type": "input_image", "image_url": _data_url(image, mime), "detail": "high"})
+def _call(content: list[dict], schema: type[T], model: str) -> T:
     response = client().responses.parse(
         model=model,
         input=[{"role": "user", "content": content}],
@@ -62,11 +51,43 @@ def ask(
     return response.output_parsed
 
 
+def _image_part(image: bytes, mime: str, detail: str = "high") -> dict:
+    return {"type": "input_image", "image_url": _data_url(image, mime), "detail": detail}
+
+
+def ask(
+    prompt: str,
+    schema: type[T],
+    images: list[bytes] | None = None,
+    text: str | None = None,
+    model: str = config.EXTRACT_MODEL,
+    mime: str = "image/jpeg",
+    detail: str = "high",
+) -> T:
+    """One call, strict structured output. `text` (e.g. a docx page) is appended after the prompt.
+    `detail`: "high" (default), "original" (full resolution, more tokens), "low" or "auto"."""
+    content: list[dict] = [{"type": "input_text", "text": prompt if text is None else f"{prompt}\n\n{text}"}]
+    content += [_image_part(image, mime, detail) for image in images or []]
+    return _call(content, schema, model)
+
+
 def ask_page(prompt: str, schema: type[T], page: Page, model: str = config.EXTRACT_MODEL) -> T:
     """`ask` for one Page, whichever kind it is (image or text)."""
     if page.image is not None:
         return ask(prompt, schema, images=[page.image], model=model, mime=page.mime)
     return ask(prompt, schema, text=page.text, model=model)
+
+
+def ask_pages(prompt: str, schema: type[T], pages: list[Page], model: str = config.EXTRACT_MODEL, text_chars: int = 1500) -> T:
+    """One call over several pages. Each page is introduced by a 'Page N' label, image pages as images,
+    text pages as their first `text_chars` characters."""
+    content: list[dict] = [{"type": "input_text", "text": prompt}]
+    for page in pages:
+        if page.image is not None:
+            content += [{"type": "input_text", "text": f"Page {page.no}:"}, _image_part(page.image, page.mime)]
+        else:
+            content.append({"type": "input_text", "text": f"Page {page.no}:\n{(page.text or '')[:text_chars]}"})
+    return _call(content, schema, model)
 
 
 def embed(texts: list[str]) -> np.ndarray:
@@ -100,6 +121,7 @@ if __name__ == "__main__":
         vectors = embed(sys.argv[2:])
         print("shape", vectors.shape, "dtype", vectors.dtype)
         print("norms", np.linalg.norm(vectors, axis=1).round(3))
+        print("vector", vectors[0, :32])
         if len(vectors) > 1:
             print("cosine(0,1)", float(vectors[0] @ vectors[1] / np.linalg.norm(vectors[0]) / np.linalg.norm(vectors[1])))
     else:

@@ -159,6 +159,44 @@ def load_csv(path: Path, rows_per_page: int = SHEET_PAGE_ROWS) -> list[Page]:
     return [Page(no=i + 1, text=t) for i, t in enumerate(_sheet_pages(path.stem, rows, rows_per_page))]
 
 
+# ---- page helpers -----------------------------------------------------------
+
+
+def shrink(page: Page, px: int) -> Page:
+    """A smaller copy of an image page (long side = px), e.g. for triage. Text pages are returned as is."""
+    if page.image is None:
+        return page
+    with Image.open(io.BytesIO(page.image)) as img:
+        return Page(no=page.no, image=_encode(img, px), mime="image/jpeg")
+
+
+def strips(page: Page, n: int, overlap: float = 0.06) -> list[bytes]:
+    """Cut an image page into n horizontal strips, top to bottom, each overlapping the next by
+    `overlap` of the page height. Used to give dense tables more pixels per row."""
+    with Image.open(io.BytesIO(page.image)) as img:
+        img = img.convert("RGB")
+        width, height = img.size
+        step, extra = height / n, round(height * overlap)
+        out = []
+        for i in range(n):
+            top, bottom = max(0, round(i * step) - extra), min(height, round((i + 1) * step) + extra)
+            buf = io.BytesIO()
+            img.crop((0, top, width, bottom)).save(buf, format="JPEG", quality=JPEG_QUALITY)
+            out.append(buf.getvalue())
+        return out
+
+
+def is_blank(page: Page, threshold: float = 6.0) -> bool:
+    """True for an empty page: no text, or an image with almost no tonal variation (scan noise included)."""
+    if page.image is None:
+        return not (page.text or "").strip()
+    with Image.open(io.BytesIO(page.image)) as img:
+        small = img.convert("L").resize((200, 280))
+    pixels = list(small.getdata())
+    mean = sum(pixels) / len(pixels)
+    return (sum((p - mean) ** 2 for p in pixels) / len(pixels)) ** 0.5 < threshold
+
+
 LOADERS: dict[str, Callable[[Path], list[Page]]] = {
     ".pdf": load_pdf,
     ".png": load_image,

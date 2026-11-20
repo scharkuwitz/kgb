@@ -51,6 +51,8 @@ WORKERS = int(_env("KGB_WORKERS", 8))  # parallel LLM calls
 # Page images
 RENDER_PX = int(_env("KGB_RENDER_PX", 2000))  # long side of rendered pages (extraction)
 TRIAGE_PX = int(_env("KGB_TRIAGE_PX", 768))  # long side of thumbnails (triage)
+# Image detail for extraction. "original" reads small print better than "high" (e.g. VAT notes) for ~10% more input tokens.
+EXTRACT_DETAIL = _env("KGB_EXTRACT_DETAIL", "original")
 
 
 def summary() -> dict[str, str]:
