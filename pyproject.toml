@@ -1,0 +1,29 @@
+[project]
+name = "kgb"
+version = "0.1.0"
+description = "General-purpose knowledge base: ingest documents, then find what they contain in plain language."
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.5",
+    "openai>=3.56.0",
+    "openpyxl>=3.1.5",
+    "pillow>=13.0.0",
+    "pydantic>=2.14.4",
+    "pypdfium2>=5.15.2",
+    "python-docx>=1.2.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""   # flat layout: the package lives in ./kgb
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
