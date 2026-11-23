@@ -274,3 +274,62 @@ def test_old_embedding_files_with_a_stale_key_are_still_reported_stale(env, fake
     (wd / "embeddings.json").write_text('{"key": "old"}', encoding="utf-8")
     n, skipped = ingest.reindex(st, work)
     assert n == 0 and "stale" in skipped[0]
+
+
+def test_converting_old_embedding_files_survives_another_process_doing_it_at_the_same_time(env, fakes, monkeypatch):
+    src, work, st = env
+    wd = work / ingest.ingest_file(src, st, work).doc_id
+    expected = _make_legacy(wd)
+
+    # (1) the other converter finishes and deletes the old files before we get to read them
+    real_load, fired = np.load, []
+
+    def load_after_other_converter(path, *a, **kw):
+        if str(path).endswith("embeddings.npy") and not fired:
+            fired.append(True)
+            vectors, key = real_load(path), json.loads((wd / "embeddings.json").read_text(encoding="utf-8"))["key"]
+            ingest._save_embeddings(wd, vectors, key)
+            (wd / "embeddings.npy").unlink()
+            (wd / "embeddings.json").unlink()
+            raise FileNotFoundError(path)
+        return real_load(path, *a, **kw)
+
+    monkeypatch.setattr(np, "load", load_after_other_converter)
+    vectors, _ = ingest._load_embeddings(wd)
+    monkeypatch.undo()
+    assert fired and np.array_equal(vectors, expected)
+
+    # (2) the other converter removes the old files while we are between publishing and removing them
+    _make_legacy(wd)
+    real_save = ingest._save_embeddings
+
+    def save_then_other_converter_cleans_up(folder, vecs, key):
+        real_save(folder, vecs, key)
+        (folder / "embeddings.npy").unlink()
+        (folder / "embeddings.json").unlink()
+
+    monkeypatch.setattr(ingest, "_save_embeddings", save_then_other_converter_cleans_up)
+    vectors, _ = ingest._load_embeddings(wd)  # our own unlink finds nothing to remove and must not raise
+    assert np.array_equal(vectors, expected)
+
+
+def test_many_threads_converting_the_same_old_folder_all_succeed(env, fakes):
+    src, work, st = env
+    wd = work / ingest.ingest_file(src, st, work).doc_id
+    expected = _make_legacy(wd)
+    results, errors = [], []
+
+    def convert():
+        try:
+            results.append(ingest._load_embeddings(wd)[0])
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=convert) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == [] and len(results) == 8
+    assert all(np.array_equal(r, expected) for r in results)
+    assert (wd / "embeddings.npz").exists()

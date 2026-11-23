@@ -120,17 +120,29 @@ def _has_embeddings(wd: Path) -> bool:
 
 def _load_embeddings(wd: Path) -> tuple[np.ndarray, str]:
     """(vectors, key). A work folder from before the single-file format (embeddings.npy + embeddings.json) is
-    converted on first use, so existing caches keep working without new model calls."""
-    if not (wd / "embeddings.npz").exists():
-        vectors = np.load(wd / "embeddings.npy")
-        key = str(_read_json(wd / "embeddings.json")["key"])
-        if vectors.ndim != 2:
-            raise IncompleteError(f"old embeddings.npy has shape {vectors.shape}")
-        _save_embeddings(wd, vectors, key)
-        (wd / "embeddings.npy").unlink()
-        (wd / "embeddings.json").unlink()
-        return vectors, key
-    with np.load(wd / "embeddings.npz") as data:
+    converted on first use, so existing caches keep working without new model calls.
+
+    Safe when several processes convert the same folder at once: the converted file is published atomically
+    and always before the old files are removed, every converter writes identical content, and a reader that
+    finds the old files gone (or locked, on Windows) simply reads the converted file."""
+    npz = wd / "embeddings.npz"
+    if not npz.exists():
+        try:
+            vectors = np.load(wd / "embeddings.npy")
+            key = str(_read_json(wd / "embeddings.json")["key"])
+        except (FileNotFoundError, PermissionError):
+            pass  # another process converted and removed them; its npz was published first
+        else:
+            if vectors.ndim != 2:
+                raise IncompleteError(f"old embeddings.npy has shape {vectors.shape}")
+            _save_embeddings(wd, vectors, key)
+            for old in (wd / "embeddings.npy", wd / "embeddings.json"):
+                try:
+                    old.unlink()
+                except (FileNotFoundError, PermissionError):
+                    pass  # already removed by another converter, or held open by one: harmless, the npz wins
+            return vectors, key
+    with np.load(npz) as data:
         return data["vectors"], str(data["key"])
 
 
