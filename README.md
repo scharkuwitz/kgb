@@ -42,6 +42,7 @@ uv run python -m kgb.meta "data/contracts/doc.pdf" [pages]      # parties and va
 uv run python -m kgb.ingest "data/contracts"                    # whole pipeline into the index (API calls the first time only)
 uv run python -m kgb.ingest --reindex                           # rebuild the index from data/work (no API calls)
 uv run python -m kgb.store fts "хамгаалалтын гутал"             # counts and a keyword lookup in the index
+uv run python -m kgb.search "хамгаалалтын гутал" "муфт 20"       # best items for each query (one embedding call)
 ```
 
 Put source documents in `data/contracts/` (git-ignored). Supported: `pdf`, `png`, `jpg`, `tif`, `webp`, `docx`, `xlsx`, `csv`.
@@ -64,11 +65,12 @@ uv run pytest -q    # offline: no API key or network needed
 | `kgb/extract.py` | Item pages → structured items; carries categories, merged cells and VAT across pages |
 | `kgb/meta.py` | Key-terms pages → contract facts (parties, validity dates, short note) |
 | `kgb/store.py` | The index (SQLite: items, vectors, keyword index); safe for concurrent readers |
+| `kgb/search.py` | Keyword (FTS5 trigram) and meaning (embeddings) fused with RRF; returns items with price and contract |
 | `kgb/ingest.py` | Document → work folder → index; every step cached, `--reindex` rebuilds from disk |
 
 ## Status
 
-Early development, built in small steps that can each be checked on their own. Done: configuration, document loading, model access, page triage, item extraction, contract facts, storage and ingestion. Next: search.
+Early development, built in small steps that can each be checked on their own. Done: configuration, document loading, model access, page triage, item extraction, contract facts, storage, ingestion and search. Next: the coverage check and the command line.
 
 ## License
 
