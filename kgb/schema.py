@@ -98,26 +98,77 @@ class ContractMeta(BaseModel):
 # ---- search and check ------------------------------------------------------
 
 
-class Hit(BaseModel):
-    """One search result: an item plus the contract it came from."""
+class ItemRecord(BaseModel):
+    """An indexed item with the facts of the contract it came from."""
 
     item_id: int
-    score: float
     name: str
     code: str | None = None
     brand: str | None = None
     category: str | None = None
     spec: str | None = None
-    unit_price: float | None = None
+    unit: str | None = None
+    unit_price: float | None = Field(None, description="Price per unit payable (after discount)")
+    list_price: float | None = Field(None, description="Price per unit before discount, when the contract shows both")
     currency: str | None = None
-    doc_id: str | None = None
+    vat_included: bool | None = None
+    doc_id: str | None = Field(None, description="Id of the source document (first 12 hex digits of its SHA-256)")
     filename: str | None = None
     supplier: str | None = None
     contract_no: str | None = None
+    valid_from: str | None = None
+    valid_to: str | None = None
+    expired: bool | None = Field(None, description="The contract ended before today; null when its end date is unknown")
+    page: int | None = Field(None, description="Page of the source document the item is on (1-based)")
+    page_image: str | None = None  # path to the rendered source page, for checking by eye
+
+
+class Hit(ItemRecord):
+    """One search result: an item, the contract it came from, and how well it matched."""
+
+    score: float = Field(description="Higher is better; the scale depends on the search mode")
+
+
+class ItemDetail(ItemRecord):
+    """One item looked up by id: the search fields plus its position, normalized text and the contract's note."""
+
+    seq: int = Field(description="Position of the item in its document (0-based)")
+    search_text: str = Field(description="The normalized description that is embedded and keyword-indexed")
+    terms_note: str | None = None
+
+
+class ContractSummary(BaseModel):
+    """One indexed document with its contract facts."""
+
+    id: str = Field(description="Document id (first 12 hex digits of the file's SHA-256)")
+    filename: str
+    n_pages: int
+    n_items: int
+    doc_type: DocType | None = None
+    contract_no: str | None = None
+    supplier: str | None = None
+    supplier_reg_no: str | None = None
+    signed_date: str | None = None
+    valid_from: str | None = None
     valid_to: str | None = None
     expired: bool | None = None
-    page: int | None = None
-    page_image: str | None = None  # path to the rendered source page, for checking by eye
+    terms_note: str | None = None
+
+
+class ContractDetail(ContractSummary):
+    items: list[ItemRecord] = Field(description="All items of the document, in document order")
+
+
+Mode = Literal["hybrid", "keyword", "semantic"]
+
+
+class SearchResult(BaseModel):
+    """The hits for one query. `Hit.score` depends on the mode: hybrid = RRF score, keyword = bm25
+    (higher is better), semantic = cosine similarity."""
+
+    query: str
+    mode: Mode
+    hits: list[Hit]
 
 
 Status = Literal["covered", "similar", "none"]

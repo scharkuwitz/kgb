@@ -2,6 +2,10 @@
 
     search("хамгаалалтын гутал", k=10)              -> list[Hit], best first (an item, its price, its contract)
     search_many(["гутал", "сандал"], k=10)          -> list[list[Hit]], one embedding request for all queries
+    search(q, mode="keyword" | "semantic" | "hybrid", active_only=True)   # one side only; skip expired contracts
+
+Modes: "hybrid" (default) fuses both sides below; "keyword" uses the trigram index alone and makes no API
+call; "semantic" uses the vectors alone. k is capped at POOL (50).
 
 Two rankings are fused with reciprocal rank fusion (RRF, k=60):
   - keyword: FTS5 trigram over the item text. The query is cut into words, words under 3 characters are
@@ -17,21 +21,24 @@ Search is read-only and thread-safe (see `kgb.store`): one `Store` can serve man
 `ingest` writes. The only network call is the query embedding.
 
 Probe:
-    uv run python -m kgb.search                              # API: the acceptance queries from the milestone list
-    uv run python -m kgb.search "муфт 20" "ус халаагч" [-k 10]   # API: your own queries
-    uv run python -m kgb.search --keyword "муфт 20"          # no API: keyword side only
+    uv run python -m kgb.search                              # API: the acceptance queries, ranks in all three modes (with --mode: that mode only)
+    uv run python -m kgb.search "муфт 20" "ус халаагч" [-k 10] [--mode semantic] [--active]   # API: your own queries
+    uv run python -m kgb.search --keyword "муфт 20"          # no API: keyword side only (= --mode keyword)
 """
 
 import threading
 from collections.abc import Callable, Iterable
 from datetime import date
 from pathlib import Path
+from typing import get_args
 
 import numpy as np
 
 from kgb import config
-from kgb.schema import Hit
+from kgb.schema import Hit, Mode
 from kgb.store import Store
+
+MODES: tuple[str, ...] = get_args(Mode)  # ("hybrid", "keyword", "semantic")
 
 RRF_K = 60  # the usual constant: damps the lead of the top ranks
 POOL = 50  # candidates taken from each side before fusing
@@ -92,25 +99,48 @@ def _embedder(embed: Embedder | None) -> Embedder:
     return llm.embed
 
 
+def _ranked(store: Store, query: str, vector: np.ndarray | None, mode: Mode,
+            active_on: date | None) -> list[tuple[int, float]]:
+    """(item_id, score) best first, at most POOL per side. `vector` is None only in keyword mode. With `active_on`,
+    expired contracts are excluded when the candidates are chosen (not afterwards), so a long run of expired
+    matches cannot push the active ones out of the pool."""
+    match = match_expression(query)
+    keyword = store.fts_search(match, POOL, active_on) if match and mode != "semantic" else []
+    if mode == "keyword":
+        return keyword
+    meaning = store.vector_search(vector, POOL, active_on)
+    if mode == "semantic":
+        return meaning
+    return rrf([[i for i, _ in keyword], [i for i, _ in meaning]])
+
+
 def search_many(
     queries: list[str],
     k: int = 10,
     store: Store | None = None,
     embed: Embedder | None = None,
     today: date | None = None,
+    mode: Mode = "hybrid",
+    active_only: bool = False,
 ) -> list[list[Hit]]:
-    """`search` for several queries with one embedding request. Result i belongs to queries[i]."""
+    """`search` for several queries with at most one embedding request (none in keyword mode).
+    Result i belongs to queries[i]."""
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}, not {mode!r}")
     store = store or _store(config.DB)
+    k = max(0, min(k, POOL))
     asked = [n for n, query in enumerate(queries) if query.strip()]  # a blank query has no results and costs nothing
     results: list[list[Hit]] = [[] for _ in queries]
-    if not asked:
+    if not asked or k == 0:
         return results
-    vectors = _embedder(embed)([queries[n] for n in asked])
+    if mode == "keyword":
+        vectors = [None] * len(asked)
+    else:
+        vectors = _embedder(embed)([queries[n] for n in asked])
+    today = today or date.today()
     for n, vector in zip(asked, vectors):
-        match = match_expression(queries[n])
-        keyword = [i for i, _ in store.fts_search(match, POOL)] if match else []
-        meaning = [i for i, _ in store.vector_search(vector, POOL)]
-        results[n] = store.hits(rrf([keyword, meaning])[:k], today)
+        ranked = _ranked(store, queries[n], vector, mode, today if active_only else None)
+        results[n] = store.hits(ranked[:k], today)
     return results
 
 
@@ -120,18 +150,20 @@ def search(
     store: Store | None = None,
     embed: Embedder | None = None,
     today: date | None = None,
+    mode: Mode = "hybrid",
+    active_only: bool = False,
 ) -> list[Hit]:
-    """The k best items for one query, with their contract facts. Blank query: no results."""
+    """The k best items for one query (k at most POOL), with their contract facts. Blank query: no results.
+    mode: "hybrid" (keyword and meaning fused), "keyword" (no API call) or "semantic" (meaning only).
+    active_only: leave out items whose contract has expired (unknown end dates are kept)."""
     if not query.strip():
         return []
-    return search_many([query], k, store, embed, today)[0]
+    return search_many([query], k, store, embed, today, mode, active_only)[0]
 
 
 def keyword_search(query: str, k: int = 10, store: Store | None = None, today: date | None = None) -> list[Hit]:
     """Keyword side alone (no API call): what the trigram index finds for the query's words."""
-    store = store or _store(config.DB)
-    match = match_expression(query)
-    return store.hits(store.fts_search(match, k), today) if match else []
+    return search(query, k, store, today=today, mode="keyword")
 
 
 # What the milestone checklist expects: (query, marker in the source filename, item code or None).
@@ -149,8 +181,8 @@ def _print_hits(hits: list[Hit]) -> None:
     for rank, h in enumerate(hits, start=1):
         price = f"{h.unit_price:,.0f} {h.currency or ''}".strip() if h.unit_price is not None else "-"
         flag = {True: "  EXPIRED", False: "", None: ""}[h.expired]
-        print(f"  {rank:>2}. {h.score:.4f}  {(h.code or ''):<10} {h.name[:44]:<44} {price:>16}  "
-              f"{(h.filename or '')[-12:]} p{h.page}{flag}")
+        print(f"  {rank:>2}. {h.score:8.4f}  {(h.code or ''):<10} {h.name[:40]:<40} {price:>16}  "
+              f"{(h.supplier or '-')[:24]:<24} {(h.contract_no or '')[:12]:<12} {(h.filename or '')[-12:]} p{h.page}{flag}")
 
 
 def _rank_of(hits: list[Hit], marker: str, code: str | None) -> int | None:
@@ -164,13 +196,22 @@ if __name__ == "__main__":
     import sys
 
     args = sys.argv[1:]
-    keyword_only = "--keyword" in args
-    k = 10
-    if "-k" in args:
-        at = args.index("-k")
-        k = int(args[at + 1])
+
+    def option(name: str, default: str) -> str:
+        if name not in args:
+            return default
+        at = args.index(name)
+        value = args[at + 1]
         del args[at : at + 2]
-    args = [a for a in args if a != "--keyword"]
+        return value
+
+    mode_given = "--keyword" in args or "--mode" in args
+    mode = "keyword" if "--keyword" in args else option("--mode", "hybrid")
+    k = int(option("-k", "10"))
+    active_only = "--active" in args
+    args = [a for a in args if a not in ("--keyword", "--active")]
+    if mode not in MODES:
+        sys.exit(f"--mode must be one of {', '.join(MODES)}")
 
     store = _store(config.DB)
     print("index", store.path.resolve(), store.counts())
@@ -178,19 +219,37 @@ if __name__ == "__main__":
         sys.exit("the index is empty: run `uv run python -m kgb.ingest data/contracts` first")
 
     if args:
-        batch = search_many(args, k, store) if not keyword_only else [keyword_search(q, k, store) for q in args]
-        for query, hits in zip(args, batch):
-            print(f"\n{query!r}  keyword terms: {terms(query)}")
+        for query, hits in zip(args, search_many(args, k, store, mode=mode, active_only=active_only)):
+            print(f"\n{query!r}  mode={mode}{'  active only' if active_only else ''}  keyword terms: {terms(query)}")
             _print_hits(hits)
     else:
-        batch = search_many([q for q, _, _ in EXPECTED], 10, store)
-        failed = 0
-        for (query, marker, code), hits in zip(EXPECTED, batch):
-            rank = _rank_of(hits, marker, code)
-            failed += rank is None
+        # the acceptance queries: only the requested mode when one is given (keyword then needs no API), else every
+        # mode; hybrid and semantic embed the same texts, so embed once and reuse
+        queries = [q for q, _, _ in EXPECTED]
+        run_modes = (mode,) if mode_given else MODES
+        cached = None
+        if any(m != "keyword" for m in run_modes):
+            from kgb import llm
+
+            vectors = dict(zip(queries, llm.embed(queries)))
+
+            def cached(texts):
+                return np.stack([vectors[t] for t in texts])
+
+        table: dict[str, list[int | None]] = {}
+        for m in run_modes:
+            batch = search_many(queries, 10, store, embed=cached, mode=m)
+            table[m] = [_rank_of(hits, marker, code) for (_, marker, code), hits in zip(EXPECTED, batch)]
+            if m == mode:
+                shown = batch
+        for (query, marker, code), hits, rank in zip(EXPECTED, shown, table[mode]):
             want = f"{marker}{' code ' + code if code else ''}"
-            print(f"\n{'PASS' if rank else 'FAIL'}  {query!r} -> expect {want}: "
+            print(f"\n{'PASS' if rank else 'FAIL'}  [{mode}] {query!r} -> expect {want}: "
                   f"{'first at rank ' + str(rank) if rank else 'not in the top 10'}   keyword terms: {terms(query)}")
             _print_hits(hits[:5])
-        print(f"\n{len(EXPECTED) - failed}/{len(EXPECTED)} queries reach the right contract")
-        sys.exit(1 if failed else 0)
+        print(f"\nrank of the expected contract in the top 10, per mode (- = missing)")
+        print(f"  {'query':<26}" + "".join(f"{m:>10}" for m in run_modes))
+        for n, (query, marker, code) in enumerate(EXPECTED):
+            print(f"  {query[:26]:<26}" + "".join(f"{table[m][n] or '-':>10}" for m in run_modes))
+        print("  " + " " * 26 + "".join(f"{sum(r is not None for r in table[m]):>8}/{len(EXPECTED)}" for m in run_modes))
+        sys.exit(0 if all(table[mode]) else 1)

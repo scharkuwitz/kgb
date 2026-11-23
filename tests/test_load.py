@@ -79,3 +79,65 @@ def test_csv(tmp_path):
 def test_unsupported_type(tmp_path):
     with pytest.raises(ValueError, match="Unsupported file type"):
         load(tmp_path / "old.doc")
+
+
+def test_pdfium_is_never_entered_by_two_threads_at_once(tmp_path, monkeypatch):
+    """PDFium is not thread-safe even across documents: concurrent load_pdf calls must take turns."""
+    import threading
+    import time
+
+    import pypdfium2
+    from PIL import Image
+
+    from kgb import load
+
+    inside, peak, guard = 0, 0, threading.Lock()
+
+    def enter():
+        nonlocal inside, peak
+        with guard:
+            inside += 1
+            peak = max(peak, inside)
+
+    def leave():
+        nonlocal inside
+        with guard:
+            inside -= 1
+
+    class FakeBitmap:
+        def to_pil(self):
+            return Image.new("RGB", (20, 30), "white")
+
+    class FakePage:
+        def get_size(self):
+            return (200.0, 300.0)
+
+        def render(self, scale):
+            time.sleep(0.01)  # wide enough for an unguarded second thread to arrive
+            return FakeBitmap()
+
+        def close(self):
+            pass
+
+    class FakeDoc:
+        def __init__(self, path):
+            enter()
+
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, i):
+            return FakePage()
+
+        def close(self):
+            leave()
+
+    monkeypatch.setattr(pypdfium2, "PdfDocument", FakeDoc)
+    results = []
+    threads = [threading.Thread(target=lambda n=n: results.append(load.load_pdf(tmp_path / f"{n}.pdf", px=50))) for n in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(results) == 6 and all(len(pages) == 3 for pages in results)
+    assert peak == 1

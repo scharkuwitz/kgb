@@ -56,11 +56,18 @@ META_PX = int(_env("KGB_META_PX", 1280))  # long side of key-terms pages (dates 
 # Image detail for extraction. "original" reads small print better than "high" (e.g. VAT notes) for ~10% more input tokens.
 EXTRACT_DETAIL = _env("KGB_EXTRACT_DETAIL", "original")
 
+# HTTP API (kgb.api)
+API_HOST = _env("KGB_API_HOST", "127.0.0.1")  # 0.0.0.0 to serve the office LAN
+API_PORT = int(_env("KGB_API_PORT", 8000))
+API_KEY = _env("KGB_API_KEY", "")  # when set, every route except /health and the docs needs it (X-API-Key header)
+MAX_UPLOAD_MB = float(_env("KGB_MAX_UPLOAD_MB", 50))  # largest PDF accepted by POST /contracts
+
 
 def summary() -> dict[str, str]:
-    """All settings as strings; the API key is only reported as set/missing."""
+    """All settings as strings; keys are only reported as set/missing."""
     out = {k: str(v) for k, v in globals().items() if k.isupper()}
     out["OPENAI_API_KEY"] = "set" if os.environ.get("OPENAI_API_KEY") else "MISSING"
+    out["API_KEY"] = "set" if API_KEY else "not set (API open)"
     return out
 
 

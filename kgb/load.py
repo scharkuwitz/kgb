@@ -11,6 +11,7 @@ Probe:
 
 import csv
 import io
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -47,21 +48,29 @@ def _encode(img: Image.Image, px: int) -> bytes:
     return buf.getvalue()
 
 
+# PDFium is not thread-safe, not even across different documents
+# (https://pypdfium2.readthedocs.io/en/stable/python_api.html#incompatibility-with-threading), so every PDFium
+# call in the process goes through this one lock. Concurrent uploads and `ingest --jobs` render one PDF at a
+# time; the slow parts (model calls) still run in parallel.
+PDFIUM_LOCK = threading.Lock()
+
+
 def load_pdf(path: Path, px: int = config.RENDER_PX) -> list[Page]:
     import pypdfium2 as pdfium
 
-    pdf = pdfium.PdfDocument(str(path))
-    try:
-        pages = []
-        for i in range(len(pdf)):
-            page = pdf[i]
-            scale = px / max(page.get_size())  # page size is in points (1/72 inch)
-            img = page.render(scale=scale).to_pil()
-            pages.append(Page(no=i + 1, image=_encode(img, px)))
-            page.close()
-        return pages
-    finally:
-        pdf.close()
+    with PDFIUM_LOCK:
+        pdf = pdfium.PdfDocument(str(path))
+        try:
+            pages = []
+            for i in range(len(pdf)):
+                page = pdf[i]
+                scale = px / max(page.get_size())  # page size is in points (1/72 inch)
+                img = page.render(scale=scale).to_pil()  # may share the bitmap's buffer, so encode under the lock too
+                pages.append(Page(no=i + 1, image=_encode(img, px)))
+                page.close()
+            return pages
+        finally:
+            pdf.close()
 
 
 def load_image(path: Path, px: int = config.RENDER_PX) -> list[Page]:
