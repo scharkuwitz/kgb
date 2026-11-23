@@ -25,7 +25,8 @@ All settings are `KGB_*` environment variables (or lines in `.env`): models, dat
 2. **Triage:** one cheap low-resolution pass labels each page, so only pages with items are read closely.
 3. **Extract:** item pages are read in parallel at full resolution into structured entries (name, code, spec, price, VAT, page). Section headers, merged cells and VAT notes are carried across page breaks, and garbled readings are retried.
 4. **Contract facts:** one cheap call over the first key-terms pages gives parties, validity dates and a short note (rough on purpose; items matter most).
-5. **Store and search** *(next)*: entries are indexed for keyword and meaning-based search.
+5. **Store:** each entry's description is embedded, and entries go into a single-file index with keyword (substring) and meaning-based lookup. Everything per document is kept in `data/work/<id>/`, so repeating a document costs nothing and the index can be rebuilt from it at any time.
+6. **Search** *(next)*: keyword and meaning matches combined into one ranked answer.
 
 ## Usage
 
@@ -38,6 +39,9 @@ uv run python -m kgb.llm embed "first text" "second text"       # embedding shap
 uv run python -m kgb.triage "data/contracts/doc.pdf"            # label every page, list the ones to extract (API call)
 uv run python -m kgb.extract "data/contracts/doc.pdf" [pages]   # items as a table + JSON in data/probe/extract (API calls)
 uv run python -m kgb.meta "data/contracts/doc.pdf" [pages]      # parties and validity dates from the key-terms pages (API calls)
+uv run python -m kgb.ingest "data/contracts"                    # whole pipeline into the index (API calls the first time only)
+uv run python -m kgb.ingest --reindex                           # rebuild the index from data/work (no API calls)
+uv run python -m kgb.store fts "хамгаалалтын гутал"             # counts and a keyword lookup in the index
 ```
 
 Put source documents in `data/contracts/` (git-ignored). Supported: `pdf`, `png`, `jpg`, `tif`, `webp`, `docx`, `xlsx`, `csv`.
@@ -59,10 +63,12 @@ uv run pytest -q    # offline: no API key or network needed
 | `kgb/triage.py` | Cheap first pass: labels each page as items / key terms / other |
 | `kgb/extract.py` | Item pages → structured items; carries categories, merged cells and VAT across pages |
 | `kgb/meta.py` | Key-terms pages → contract facts (parties, validity dates, short note) |
+| `kgb/store.py` | The index (SQLite: items, vectors, keyword index); safe for concurrent readers |
+| `kgb/ingest.py` | Document → work folder → index; every step cached, `--reindex` rebuilds from disk |
 
 ## Status
 
-Early development, built in small steps that can each be checked on their own. Done: configuration, document loading, model access, page triage, item extraction, contract facts. Next: storage, search.
+Early development, built in small steps that can each be checked on their own. Done: configuration, document loading, model access, page triage, item extraction, contract facts, storage and ingestion. Next: search.
 
 ## License
 
