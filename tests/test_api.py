@@ -267,3 +267,74 @@ def test_the_openapi_document_describes_every_route(client):
     paths = client.get("/openapi.json").json()["paths"]
     assert {"/health", "/search", "/items/{item_id}", "/contracts", "/contracts/{doc_id}"} <= set(paths)
     assert {"get", "post"} <= set(paths["/search"]) and {"get", "post"} <= set(paths["/contracts"])
+
+
+# ---- upload size is enforced before the body is parsed ---------------------------------------
+
+
+def test_a_declared_oversized_body_is_refused_before_parsing(client, monkeypatch, calls):
+    monkeypatch.setattr(config, "MAX_UPLOAD_MB", 0.5)  # limit + multipart slack is about 0.56 MB
+    big = b"%PDF-1.4\n" + b"0" * (2 * 1024 * 1024)
+    r = client.post("/contracts", files={"file": ("big.pdf", big, "application/pdf")})
+    assert r.status_code == 413 and "0.5 MB" in r.json()["detail"]
+    assert calls.triage == 0
+
+
+def test_a_streamed_body_stops_being_read_at_the_limit(monkeypatch):
+    """No Content-Length (chunked upload): the guard counts bytes and stops reading once past the limit."""
+    import asyncio
+
+    monkeypatch.setattr(config, "MAX_UPLOAD_MB", 1)
+    chunk, total_chunks, reads = b"x" * (256 * 1024), 400, 0  # 100 MB offered in 256 KB pieces
+    sent = []
+
+    async def receive():
+        nonlocal reads
+        reads += 1
+        return {"type": "http.request", "body": chunk, "more_body": reads < total_chunks}
+
+    async def send(message):
+        sent.append(message)
+
+    async def greedy_app(scope, receive, send):  # stands in for multipart parsing: reads everything
+        while True:
+            message = await receive()
+            if not message.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 201, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+    scope = {"type": "http", "method": "POST", "path": "/contracts", "headers": [(b"content-type", b"multipart/form-data; boundary=b")]}
+    asyncio.run(api.UploadSizeLimit(greedy_app)(scope, receive, send))
+    assert sent[0]["status"] == 413
+    assert reads <= 6  # 1 MB + slack is about 4.25 chunks; the other ~99 MB were never read
+
+
+def test_an_app_error_after_the_limit_still_becomes_413(monkeypatch):
+    """If the parser swallows the aborted read and answers 400 itself, the guard still answers 413."""
+    import asyncio
+
+    monkeypatch.setattr(config, "MAX_UPLOAD_MB", 0.1)
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"x" * (512 * 1024), "more_body": True}
+
+    async def send(message):
+        sent.append(message)
+
+    async def swallowing_app(scope, receive, send):
+        try:
+            await receive()
+        except Exception:  # noqa: BLE001 - what a body parser that reports "error parsing the body" does
+            await send({"type": "http.response.start", "status": 400, "headers": []})
+            await send({"type": "http.response.body", "body": b"bad"})
+
+    scope = {"type": "http", "method": "POST", "path": "/contracts", "headers": []}
+    asyncio.run(api.UploadSizeLimit(swallowing_app)(scope, receive, send))
+    assert [m.get("status") for m in sent if m["type"] == "http.response.start"] == [413]
+
+
+def test_the_size_guard_leaves_other_routes_alone(client, monkeypatch):
+    monkeypatch.setattr(config, "MAX_UPLOAD_MB", 0.0001)
+    assert client.post("/search", json={"queries": ["гутал"] * 50, "k": 1}).status_code == 200

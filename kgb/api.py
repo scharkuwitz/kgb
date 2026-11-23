@@ -24,6 +24,7 @@ Concurrency: one process, one shared `Store` (thread-safe; the vector matrix is 
 on the server's thread pool; the upload route hands the slow pipeline to that pool too, so searches keep flowing.
 """
 
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -142,7 +143,69 @@ and is the contract still valid?**
 * `POST /contracts` adds exactly one PDF. A PDF already ingested returns at once from cache.
 """
 
+UPLOAD_PATH = "/contracts"
+MULTIPART_SLACK = 64 * 1024  # boundaries and part headers around the file in a multipart body
+
+
+class _TooLarge(Exception):
+    pass
+
+
+class UploadSizeLimit:
+    """ASGI guard for `POST /contracts`: refuses a body larger than KGB_MAX_UPLOAD_MB (plus multipart overhead)
+    with 413 *before* it is parsed, so an oversized upload never reaches memory or the temp-file spool.
+    A declared Content-Length over the limit is refused without reading the body; a streamed (chunked) body is
+    counted while it is read, and reading stops at the limit."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] != "POST" or scope["path"].rstrip("/") != UPLOAD_PATH:
+            return await self.app(scope, receive, send)
+        limit = int(config.MAX_UPLOAD_MB * 1024 * 1024) + MULTIPART_SLACK
+        declared = dict(scope["headers"]).get(b"content-length")
+        if declared is not None and declared.isdigit() and int(declared) > limit:
+            return await self._refuse(send)
+        received, exceeded, started = 0, False, False
+
+        async def counted_receive():
+            nonlocal received, exceeded
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    exceeded = True
+                    raise _TooLarge  # stop reading; whatever the app makes of it, the response becomes 413
+            return message
+
+        async def guarded_send(message):
+            nonlocal started
+            if exceeded:  # the app turned the aborted read into some error response: replace it
+                if message["type"] == "http.response.start" and not started:
+                    started = True
+                    await self._refuse(send)
+                return
+            started = started or message["type"] == "http.response.start"
+            await send(message)
+
+        try:
+            await self.app(scope, counted_receive, guarded_send)
+        except _TooLarge:
+            if not started:
+                await self._refuse(send)
+
+    @staticmethod
+    async def _refuse(send) -> None:
+        body = json.dumps({"detail": f"the upload is larger than the limit of {config.MAX_UPLOAD_MB:g} MB "
+                                     "(KGB_MAX_UPLOAD_MB)"}).encode()
+        await send({"type": "http.response.start", "status": 413,
+                    "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+        await send({"type": "http.response.body", "body": body})
+
+
 app = FastAPI(title="KGB contract item search", version="0.1.0", description=DESCRIPTION, lifespan=lifespan)
+app.add_middleware(UploadSizeLimit)
 protected = [Depends(require_key)]
 
 
@@ -228,6 +291,9 @@ async def add_contract(
     uploads = [value for _, value in form.multi_items() if not isinstance(value, str)]
     if len(uploads) != 1:
         raise HTTPException(400, f"send exactly one file, not {len(uploads)}")
+    # UploadSizeLimit already bounds the whole body; this refuses a file over the exact limit without reading it
+    if file.size is not None and file.size > config.MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(413, f"the file is {file.size / 1024 / 1024:.1f} MB; the limit is {config.MAX_UPLOAD_MB:g} MB (KGB_MAX_UPLOAD_MB)")
     data = await file.read()
     try:
         report = await run_in_threadpool(ingest.ingest_pdf, data, file.filename or "upload.pdf", store)

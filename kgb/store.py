@@ -106,6 +106,7 @@ class _Snapshot:
     generation: int
     ids: np.ndarray  # int64, (n,)
     matrix: np.ndarray  # float32, (n, dim), rows unit length
+    valid_to: np.ndarray  # str, (n,): the contract's end date per row, "" when unknown (for active-only searches)
 
 
 def fts_text(item: Item) -> str:
@@ -136,6 +137,10 @@ _HIT_SELECT = (
     " c.terms_note, d.id AS doc_id, d.filename"
     " FROM items i JOIN documents d ON d.id = i.doc_id LEFT JOIN contracts c ON c.doc_id = i.doc_id"
 )
+
+# An item whose contract has not ended before a given day (the ? parameter, ISO date) or has no end date.
+# Must agree with `_expired` below and with the vector snapshot's filter in `vector_search`.
+_ACTIVE = "(c.valid_to IS NULL OR c.valid_to = '' OR c.valid_to >= ?)"
 
 # One document with its contract facts and item count.
 _DOC_SELECT = (
@@ -303,18 +308,24 @@ class Store:
 
     # ---- reads -----------------------------------------------------------------
 
-    def fts_search(self, match: str, k: int = 50) -> list[tuple[int, float]]:
+    def fts_search(self, match: str, k: int = 50, active_on: date | None = None) -> list[tuple[int, float]]:
         """Keyword search. `match` is an FTS5 expression (trigram tokenizer: substring match, case-insensitive,
-        terms shorter than 3 characters match nothing). Score: higher is better."""
+        terms shorter than 3 characters match nothing). Score: higher is better. With `active_on`, only items whose
+        contract has not ended before that day (or has no end date) are candidates, so the k returned are all active."""
+        sql = "SELECT items_fts.rowid, -bm25(items_fts) FROM items_fts"
+        params: list = [match]
+        if active_on is not None:
+            sql += f" JOIN items i ON i.id = items_fts.rowid LEFT JOIN contracts c ON c.doc_id = i.doc_id WHERE items_fts MATCH ? AND {_ACTIVE}"
+            params.append(active_on.isoformat())
+        else:
+            sql += " WHERE items_fts MATCH ?"
         with self._reader() as con:
-            rows = con.execute(
-                "SELECT rowid, -bm25(items_fts) FROM items_fts WHERE items_fts MATCH ? ORDER BY bm25(items_fts) LIMIT ?",
-                (match, k),
-            ).fetchall()
+            rows = con.execute(f"{sql} ORDER BY bm25(items_fts) LIMIT ?", (*params, k)).fetchall()
         return [(int(i), float(s)) for i, s in rows]
 
-    def vector_search(self, vector: np.ndarray, k: int = 50) -> list[tuple[int, float]]:
-        """Nearest items by cosine similarity, best first."""
+    def vector_search(self, vector: np.ndarray, k: int = 50, active_on: date | None = None) -> list[tuple[int, float]]:
+        """Nearest items by cosine similarity, best first. With `active_on`, only items whose contract has not
+        ended before that day (or has no end date) are candidates."""
         snap = self._snapshot()
         if k <= 0 or not len(snap.ids):
             return []
@@ -322,8 +333,13 @@ class Store:
         if query.shape[0] != snap.matrix.shape[1]:
             raise ValueError(f"query has {query.shape[0]} dimensions, the index has {snap.matrix.shape[1]}")
         scores = snap.matrix @ _unit(query)
-        k = min(k, len(scores))
-        top = np.argpartition(-scores, k - 1)[:k]
+        rows = np.arange(len(scores))
+        if active_on is not None:
+            rows = rows[(snap.valid_to == "") | (snap.valid_to >= active_on.isoformat())]
+            if not len(rows):
+                return []
+        k = min(k, len(rows))
+        top = rows[np.argpartition(-scores[rows], k - 1)[:k]]
         top = top[np.argsort(-scores[top])]
         return [(int(snap.ids[i]), float(scores[i])) for i in top]
 
@@ -441,7 +457,11 @@ class Store:
                 n = con.execute("SELECT COUNT(*) FROM vectors").fetchone()[0]
                 ids = np.empty(n, dtype=np.int64)
                 matrix = np.empty((n, dim), dtype=np.float32)
-                for row, (item_id, blob) in enumerate(con.execute("SELECT item_id, vec FROM vectors ORDER BY item_id")):
+                valid_to = []
+                for row, (item_id, blob, end) in enumerate(con.execute(
+                    "SELECT v.item_id, v.vec, c.valid_to FROM vectors v JOIN items i ON i.id = v.item_id"
+                    " LEFT JOIN contracts c ON c.doc_id = i.doc_id ORDER BY v.item_id"
+                )):
                     if len(blob) != dim * 4:
                         raise RuntimeError(
                             f"item {item_id} has a {len(blob) // 4}-dimensional vector but KGB_EMBED_DIM is {dim}: "
@@ -449,9 +469,10 @@ class Store:
                         )
                     ids[row] = item_id
                     matrix[row] = np.frombuffer(blob, dtype="<f4")
+                    valid_to.append(end or "")
             finally:
                 con.execute("COMMIT")
-        return _Snapshot(generation, ids, _unit(matrix))
+        return _Snapshot(generation, ids, _unit(matrix), np.array(valid_to, dtype=str).reshape(n))
 
 
 if __name__ == "__main__":

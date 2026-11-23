@@ -230,3 +230,24 @@ def test_unknown_mode_and_k_cap(st):
         search.search("гутал", store=st, embed=embedder({}), mode="fuzzy")
     assert len(search.search("гутал", k=10_000, store=st, embed=embedder({}))) == 6  # capped at POOL, index has 6
     assert search.search("гутал", k=0, store=st, embed=embedder({})) == []
+
+
+def test_active_only_reaches_active_items_beyond_the_candidate_pool(tmp_path):
+    """More than POOL expired items outrank the active ones on both sides; active_only must still find them."""
+    store = Store(tmp_path / "kgb.sqlite")
+    n_old = search.POOL + 20
+    old_vectors = np.zeros((n_old, DIM), dtype=np.float32)
+    old_vectors[:, 0] = 1  # exactly the query direction
+    store.upsert(DocRecord("old", "old.pdf", 1, ContractMeta(doc_type="framework", valid_to="2020-01-01"),
+                           [item(f"гутал {n}") for n in range(n_old)], old_vectors))
+    new_items = [item(f"гутал хамгаалалтын өвлийн шинэ загвар {n}") for n in range(3)]  # longer text: lower bm25
+    new_vectors = np.tile(np.array([0.6, 0.8, 0, 0], dtype=np.float32), (3, 1))  # further from the query
+    store.upsert(DocRecord("new", "new.pdf", 1, ContractMeta(doc_type="framework", valid_to="2099-01-01"),
+                           new_items, new_vectors))
+    embed = embedder({"гутал": 0})
+    for mode in search.MODES:
+        plain = search.search("гутал", k=3, store=store, embed=embed, mode=mode, today=date(2026, 6, 1))
+        assert all(h.filename == "old.pdf" for h in plain), mode  # without the filter the expired ones fill the top
+        active = search.search("гутал", k=3, store=store, embed=embed, mode=mode, today=date(2026, 6, 1), active_only=True)
+        assert [h.filename for h in active] == ["new.pdf"] * 3, mode
+        assert all(h.expired is False for h in active)

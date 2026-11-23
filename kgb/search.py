@@ -99,13 +99,16 @@ def _embedder(embed: Embedder | None) -> Embedder:
     return llm.embed
 
 
-def _ranked(store: Store, query: str, vector: np.ndarray | None, mode: Mode) -> list[tuple[int, float]]:
-    """(item_id, score) best first, at most POOL per side. `vector` is None only in keyword mode."""
+def _ranked(store: Store, query: str, vector: np.ndarray | None, mode: Mode,
+            active_on: date | None) -> list[tuple[int, float]]:
+    """(item_id, score) best first, at most POOL per side. `vector` is None only in keyword mode. With `active_on`,
+    expired contracts are excluded when the candidates are chosen (not afterwards), so a long run of expired
+    matches cannot push the active ones out of the pool."""
     match = match_expression(query)
-    keyword = store.fts_search(match, POOL) if match and mode != "semantic" else []
+    keyword = store.fts_search(match, POOL, active_on) if match and mode != "semantic" else []
     if mode == "keyword":
         return keyword
-    meaning = store.vector_search(vector, POOL)
+    meaning = store.vector_search(vector, POOL, active_on)
     if mode == "semantic":
         return meaning
     return rrf([[i for i, _ in keyword], [i for i, _ in meaning]])
@@ -134,12 +137,10 @@ def search_many(
         vectors = [None] * len(asked)
     else:
         vectors = _embedder(embed)([queries[n] for n in asked])
+    today = today or date.today()
     for n, vector in zip(asked, vectors):
-        ranked = _ranked(store, queries[n], vector, mode)
-        if active_only:  # filter before cutting to k, so k active hits come back when that many exist
-            results[n] = [h for h in store.hits(ranked, today) if h.expired is not True][:k]
-        else:
-            results[n] = store.hits(ranked[:k], today)
+        ranked = _ranked(store, queries[n], vector, mode, today if active_only else None)
+        results[n] = store.hits(ranked[:k], today)
     return results
 
 
