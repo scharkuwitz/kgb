@@ -22,7 +22,7 @@ Probe:
     uv run python -m kgb.search --keyword "муфт 20"          # no API: keyword side only
 """
 
-import functools
+import threading
 from collections.abc import Callable, Iterable
 from datetime import date
 from pathlib import Path
@@ -68,10 +68,20 @@ def rrf(rankings: Iterable[Iterable[int]], k: int = RRF_K) -> list[tuple[int, fl
     return sorted(scores.items(), key=lambda pair: -pair[1])  # sorted() is stable
 
 
-@functools.cache
+_stores: dict[Path, Store] = {}
+_stores_lock = threading.Lock()
+
+
 def _store(path: Path) -> Store:
-    """One Store per index file for the process, so its vector matrix is loaded once and shared."""
-    return Store(path)
+    """One Store per index file for the process, so its vector matrix is loaded once and shared.
+    Lookup and construction happen under one lock: `functools.cache` would let several threads that miss
+    at the same moment each build (and keep) a Store of their own, each loading its own copy of the matrix."""
+    key = Path(path).resolve()
+    with _stores_lock:
+        store = _stores.get(key)
+        if store is None:
+            store = _stores[key] = Store(key)
+        return store
 
 
 def _embedder(embed: Embedder | None) -> Embedder:

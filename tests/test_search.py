@@ -1,6 +1,7 @@
 """Offline tests for kgb.search (a real SQLite store in a temp folder, a fake embedder, no API)."""
 
 import threading
+import time
 from datetime import date
 
 import numpy as np
@@ -167,3 +168,29 @@ def test_concurrent_searches_while_the_index_changes(st):
         for t in threads:
             t.join()
     assert errors == []
+
+
+def test_first_concurrent_searches_build_one_store(tmp_path, monkeypatch):
+    built = []
+
+    class SlowStore:
+        def __init__(self, path):
+            built.append(path)
+            time.sleep(0.05)  # wide enough that every thread arrives while the first is still building
+
+    monkeypatch.setattr(search, "Store", SlowStore)
+    monkeypatch.setattr(search, "_stores", {})
+    path = tmp_path / "kgb.sqlite"
+    got, barrier = [], threading.Barrier(8)
+
+    def grab():
+        barrier.wait()
+        got.append(search._store(path))
+
+    threads = [threading.Thread(target=grab) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(built) == 1 and len({id(s) for s in got}) == 1 and len(got) == 8
+    assert search._store(tmp_path / "other.sqlite") is not got[0]  # a different file gets its own Store
