@@ -31,8 +31,10 @@ Probe (no API calls):
     uv run python -m kgb.store fts "муфт 20"        # keyword lookup, printed as hits
 """
 
+import hashlib
 import sqlite3
 import threading
+import warnings
 from collections.abc import Iterable, Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
@@ -44,11 +46,14 @@ import numpy as np
 from kgb import config
 from kgb.schema import ContractMeta, Hit, Item
 
+SCHEMA_VERSION = 2  # bump when the tables change; an index with another version is dropped (it is disposable)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
     id TEXT PRIMARY KEY,
     filename TEXT NOT NULL,
-    n_pages INTEGER NOT NULL
+    n_pages INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS contracts (
     doc_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
@@ -56,7 +61,7 @@ CREATE TABLE IF NOT EXISTS contracts (
     signed_date TEXT, valid_from TEXT, valid_to TEXT, terms_note TEXT
 );
 CREATE TABLE IF NOT EXISTS items (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,  -- never reused, so an id from an earlier search cannot name a different item
     doc_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     seq INTEGER NOT NULL,
     name TEXT NOT NULL, code TEXT, brand TEXT, category TEXT, spec TEXT, unit TEXT,
@@ -72,7 +77,10 @@ CREATE TABLE IF NOT EXISTS vectors (
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(text, tokenize='trigram');
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 INSERT OR IGNORE INTO state VALUES ('generation', 0);
-"""
+INSERT OR IGNORE INTO state VALUES ('schema', %d);
+""" % SCHEMA_VERSION
+
+_TABLES = ("items_fts", "vectors", "items", "contracts", "documents")
 
 BUSY_MS = 30_000
 _IN_CHUNK = 500  # ids per "IN (...)" query
@@ -108,6 +116,16 @@ def fts_text(item: Item) -> str:
     return text
 
 
+def fingerprint(record: DocRecord) -> str:
+    """Hash of everything the index stores for a document: equal fingerprints mean nothing would change."""
+    digest = hashlib.sha256()
+    for part in (record.filename, str(record.n_pages), record.meta.model_dump_json(), *(i.model_dump_json() for i in record.items)):
+        digest.update(part.encode("utf-8"))
+        digest.update(b"")
+    digest.update(np.ascontiguousarray(record.vectors, dtype="<f4").tobytes())
+    return digest.hexdigest()
+
+
 def _unit(rows: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(rows, axis=-1, keepdims=True)
     return rows / np.where(norms == 0, 1, norms)
@@ -122,7 +140,28 @@ class Store:
         self._snap: _Snapshot | None = None
         with closing(self._connect()) as con:
             con.execute("PRAGMA journal_mode=WAL")
+            self._migrate(con)
             con.executescript(SCHEMA)
+
+    @staticmethod
+    def _migrate(con: sqlite3.Connection) -> None:
+        """An index written by an older layout is dropped, not converted: `ingest --reindex` refills it from
+        the work folders without model calls. The generation is bumped so running readers reload."""
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            has_state = con.execute("SELECT 1 FROM sqlite_master WHERE name = 'state'").fetchone()
+            row = has_state and con.execute("SELECT value FROM state WHERE key = 'schema'").fetchone()
+            if has_state and (row is None or row[0] != SCHEMA_VERSION):
+                for table in _TABLES:
+                    con.execute(f"DROP TABLE IF EXISTS {table}")
+                con.execute("DELETE FROM state WHERE key = 'schema'")
+                con.execute("UPDATE state SET value = value + 1 WHERE key = 'generation'")
+                warnings.warn("the index used an older layout and was emptied; run `python -m kgb.ingest --reindex`",
+                              RuntimeWarning, stacklevel=3)
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
 
     # ---- connections -----------------------------------------------------------
 
@@ -154,23 +193,31 @@ class Store:
 
     # ---- writes ----------------------------------------------------------------
 
-    def upsert(self, record: DocRecord) -> None:
-        """Insert or replace one document with its items and vectors, atomically."""
+    def upsert(self, record: DocRecord) -> bool:
+        """Insert or replace one document with its items and vectors, atomically. Returns False, touching
+        nothing (no write lock, no generation bump, so searchers keep their cached vectors), when the index
+        already holds exactly this content."""
         self._check(record)
+        stamp = fingerprint(record)
+        with self._reader() as con:
+            row = con.execute("SELECT fingerprint FROM documents WHERE id = ?", (record.doc_id,)).fetchone()
+        if row and row[0] == stamp:
+            return False
         with self._writer() as con:
             self._delete(con, record.doc_id)
-            self._insert(con, record)
+            self._insert(con, record, stamp)
+        return True
 
     def replace_all(self, records: Iterable[DocRecord]) -> int:
         """Rebuild the whole index in one transaction. Readers keep the old contents until the commit;
         if anything fails (including the iterable) the old contents stay. Returns the number of documents."""
         count = 0
         with self._writer() as con:
-            for table in ("items_fts", "vectors", "items", "contracts", "documents"):
+            for table in _TABLES:
                 con.execute(f"DELETE FROM {table}")
             for record in records:
                 self._check(record)
-                self._insert(con, record)
+                self._insert(con, record, fingerprint(record))
                 count += 1
         return count
 
@@ -193,8 +240,8 @@ class Store:
         return con.execute("DELETE FROM documents WHERE id = ?", (doc_id,)).rowcount > 0
 
     @staticmethod
-    def _insert(con: sqlite3.Connection, record: DocRecord) -> None:
-        con.execute("INSERT INTO documents VALUES (?, ?, ?)", (record.doc_id, record.filename, record.n_pages))
+    def _insert(con: sqlite3.Connection, record: DocRecord, stamp: str) -> None:
+        con.execute("INSERT INTO documents VALUES (?, ?, ?, ?)", (record.doc_id, record.filename, record.n_pages, stamp))
         m = record.meta
         con.execute(
             "INSERT INTO contracts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",

@@ -1,6 +1,8 @@
 """Offline tests for kgb.ingest: a real csv file, a real work directory and index, every model call faked."""
 
 import hashlib
+import os
+import threading
 
 import numpy as np
 import pytest
@@ -70,10 +72,12 @@ def test_first_run_does_every_stage_and_writes_the_artifacts(env, fakes):
     wd = work / report.doc_id
     assert report.ran == ["triage", "extract:1", "meta", "embed"]
     assert (report.filename, report.n_pages, report.n_items) == ("contract.csv", 1, 3)
-    for name in ("source.csv", "doc.json", "triage.json", "items/001.json", "items.json", "meta.json", "embeddings.npy", "embeddings.json"):
+    for name in ("source.csv", "doc.json", "triage.json", "items/001.json", "items.json", "meta.json", "embeddings.npz"):
         assert (wd / name).exists(), name
     assert st.counts()["items"] == 3 and st.counts()["vectors"] == 3
     assert [d["supplier"] for d in st.documents()] == ["Нийлүүлэгч"]
+    assert report.indexed is True
+    assert not list(wd.rglob("*.tmp"))  # no temporary files left behind
 
 
 def test_rerun_makes_no_model_call_and_does_not_even_load_the_file(env, fakes):
@@ -159,7 +163,8 @@ def test_reindex_skips_incomplete_and_stale_directories_and_says_why(env, fakes,
     (work / "deadbeef0000" / "doc.json").write_text("{}", encoding="utf-8")
     n, skipped = ingest.reindex(st, work)
     assert n == 1 and len(skipped) == 1 and skipped[0].startswith("deadbeef0000: missing")
-    (work / good.doc_id / "embeddings.json").write_text('{"key": "old"}', encoding="utf-8")
+    vectors, _ = ingest._load_embeddings(work / good.doc_id)
+    ingest._save_embeddings(work / good.doc_id, vectors, "old")
     n, skipped = ingest.reindex(st, work)
     assert n == 0 and "stale" in skipped[0]
 
@@ -177,3 +182,61 @@ def test_folder_ingest_skips_unsupported_files(env, fakes, tmp_path):
 def test_embedded_text_is_the_search_text_with_the_name_as_fallback():
     assert ingest.embed_text(Item(name="Гутал", search_text="  хамгаалалтын гутал ")) == "хамгаалалтын гутал"
     assert ingest.embed_text(Item(name="Гутал", search_text="")) == "Гутал"
+
+
+def test_a_cached_rerun_leaves_the_index_untouched_so_searchers_keep_their_cache(env, fakes, tmp_path):
+    src, work, st = env
+    assert ingest.ingest_file(src, st, work).indexed is True
+    generation = st.counts()["generation"]
+    again = ingest.ingest_file(src, st, work)
+    assert again.indexed is False and st.counts()["generation"] == generation
+    fresh = store.Store(tmp_path / "other.sqlite")  # an index that lost the document gets it back, still without model calls
+    calls = (fakes.triage, fakes.extract, fakes.meta, fakes.embed)
+    assert ingest.ingest_file(src, fresh, work).indexed is True
+    assert (fakes.triage, fakes.extract, fakes.meta, fakes.embed) == calls
+
+
+def test_an_interrupted_reembedding_never_pairs_new_vectors_with_an_old_key(env, fakes, monkeypatch):
+    src, work, st = env
+    report = ingest.ingest_file(src, st, work)
+    wd = work / report.doc_id
+    items = wd / "items" / "001.json"
+    items.write_text(items.read_text(encoding="utf-8").replace("гутал", "гутал2"), encoding="utf-8")
+    real_replace = os.replace
+
+    def crash_on_embeddings(src_path, dst):
+        if str(dst).endswith("embeddings.npz"):
+            raise OSError("power cut")
+        return real_replace(src_path, dst)
+
+    monkeypatch.setattr(os, "replace", crash_on_embeddings)
+    with pytest.raises(OSError):
+        ingest.ingest_file(src, st, work)
+    monkeypatch.undo()
+    assert not list(wd.rglob("*.tmp"))
+    n, skipped = ingest.reindex(st, work)
+    assert n == 0 and "stale" in skipped[0]  # detected, not silently indexed
+
+
+def test_concurrent_writers_of_one_artifact_do_not_collide(tmp_path):
+    target = tmp_path / "items.json"
+    errors = []
+
+    def payload(n, i):
+        return f"writer {n} round {i};".encode() * 1000
+
+    def writer(n):
+        try:
+            for i in range(40):
+                ingest._write_bytes(target, payload(n, i))
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=writer, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert target.read_bytes() in {payload(n, i) for n in range(8) for i in range(40)}  # one complete payload, never a mix
+    assert [p.name for p in tmp_path.iterdir()] == ["items.json"]

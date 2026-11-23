@@ -1,6 +1,8 @@
 """Offline tests for kgb.store (a real SQLite file in a temp folder, tiny vectors)."""
 
+import sqlite3
 import threading
+from contextlib import closing
 from datetime import date
 
 import numpy as np
@@ -166,3 +168,42 @@ def test_reads_keep_working_while_a_writer_replaces_documents(st):
         for t in threads:
             t.join()
     assert errors == []
+
+
+def test_item_ids_are_never_reused_so_stale_search_results_are_dropped(st):
+    st.upsert(record("a"))
+    stale = st.vector_search(vec(1, 0, 0, 0), k=3) + st.fts_search('"гутал"')
+    st.delete_doc("a")
+    st.upsert(record("b", items=[item("Огт өөр бараа")], vectors=vec([1, 0, 0, 0])))  # would have taken id 1 before
+    assert st.hits(stale) == []
+    assert st.replace_all([record("c", items=[item("Дахин өөр")], vectors=vec([1, 0, 0, 0]))]) == 1
+    assert st.hits(stale) == []
+    (fresh,) = st.hits(st.vector_search(vec(1, 0, 0, 0), k=1))
+    assert fresh.name == "Дахин өөр" and fresh.item_id > 4
+
+
+def test_upserting_identical_content_changes_nothing(st):
+    assert st.upsert(record()) is True
+    generation = st.counts()["generation"]
+    assert st.upsert(record()) is False
+    assert st.counts()["generation"] == generation  # searchers keep their cached vectors
+    changed = record(items=[item("Хамгаалалтын гутал", "G1", price=90000.0), item("Оффисын сандал"), item("Муфт")])
+    assert st.upsert(changed) is True and st.counts()["generation"] == generation + 1
+    assert st.upsert(record(vectors=np.ones((3, DIM), dtype=np.float32))) is True  # vectors count too
+    assert st.counts()["items"] == 3
+
+
+def test_an_index_with_an_older_layout_is_emptied_not_misread(tmp_path):
+    path = tmp_path / "old.sqlite"
+    with closing(sqlite3.connect(path)) as con:  # version 1: no fingerprint, no schema row
+        con.executescript(
+            "CREATE TABLE documents (id TEXT PRIMARY KEY, filename TEXT NOT NULL, n_pages INTEGER NOT NULL);"
+            "CREATE TABLE state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);"
+            "INSERT INTO state VALUES ('generation', 5);"
+            "INSERT INTO documents VALUES ('x', 'x.pdf', 1);"
+        )
+    with pytest.warns(RuntimeWarning, match="reindex"):
+        st = Store(path)
+    assert st.counts()["documents"] == 0 and st.counts()["generation"] == 6
+    assert st.upsert(record()) is True
+    assert Store(path).counts()["items"] == 3  # a second open of the new layout keeps its data

@@ -12,7 +12,7 @@ under another name is the same document). It is the source of truth and the LLM 
     items/NNN.json      raw extraction of one item page (written as each page finishes, so a crash resumes)
     items.json          all items after fill_forward (rewritten on every run; it is free)
     meta.json           contract facts
-    embeddings.npy      one vector per item, plus embeddings.json with a key over model, dimension and texts
+    embeddings.npz      one vector per item and, in the same file, a key over model, dimension and texts
 
 So re-running a file makes no model call, deleting the index loses nothing, and changing a stage's
 artifact (delete one file) redoes only that stage and what depends on it.
@@ -30,7 +30,7 @@ import hashlib
 import io
 import json
 import os
-import shutil
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -42,6 +42,9 @@ from kgb import config, extract, llm, load, meta, store, triage
 from kgb.schema import ContractMeta, Item, PageItems
 
 
+REPLACE_TRIES = 40  # retries of os.replace on a Windows sharing violation (about 8 s in total)
+
+
 @dataclass
 class Report:
     doc_id: str
@@ -49,6 +52,7 @@ class Report:
     n_pages: int
     n_items: int
     ran: list[str] = field(default_factory=list)  # stages that did work, e.g. ["triage", "extract:7", "meta", "embed"]
+    indexed: bool = False  # the index changed (False when it already held exactly this document)
     llm_calls: int = 0
     seconds: float = 0.0
 
@@ -69,10 +73,25 @@ def sha12(path: str | Path) -> str:
 
 
 def _write_bytes(path: Path, data: bytes) -> None:
-    """Write via a temporary file so a crash never leaves a half-written artifact behind."""
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    """Write via a temporary file so a crash never leaves a half-written artifact behind. The temporary name is
+    unique per call, so two processes ingesting the same document cannot trip over each other: each publishes a
+    complete file and the last one wins (the stages are deterministic enough that either is fine, and the
+    embedding key ties vectors to the texts they were made from)."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        for attempt in range(REPLACE_TRIES):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:  # Windows: the target is briefly held open by a reader or another replace
+                if attempt == REPLACE_TRIES - 1:
+                    raise
+                time.sleep(0.01 * (attempt + 1))
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def _write_json(path: Path, obj) -> None:
@@ -86,6 +105,18 @@ def _read_json(path: Path):
 def embed_text(item: Item) -> str:
     """The text that is embedded for an item."""
     return item.search_text.strip() or item.name
+
+
+def _save_embeddings(wd: Path, vectors: np.ndarray, key: str) -> None:
+    """Vectors and their key in one file, so no crash can pair vectors with the wrong key."""
+    buf = io.BytesIO()
+    np.savez(buf, vectors=vectors, key=np.array(key))
+    _write_bytes(wd / "embeddings.npz", buf.getvalue())
+
+
+def _load_embeddings(wd: Path) -> tuple[np.ndarray, str]:
+    with np.load(wd / "embeddings.npz") as data:
+        return data["vectors"], str(data["key"])
 
 
 def _embed_key(items: list[Item]) -> str:
@@ -155,20 +186,16 @@ def ingest_file(path: str | Path, st: store.Store | None = None, work: str | Pat
     contract = ContractMeta.model_validate(_read_json(wd / "meta.json"))
 
     key = _embed_key(items)
-    info = wd / "embeddings.json"
-    if info.exists() and (wd / "embeddings.npy").exists() and _read_json(info).get("key") == key:
-        vectors = np.load(wd / "embeddings.npy")
-    else:
+    vectors, stored_key = _load_embeddings(wd) if (wd / "embeddings.npz").exists() else (None, None)
+    if stored_key != key:
         vectors = llm.embed([embed_text(i) for i in items])
-        buf = io.BytesIO()
-        np.save(buf, vectors)
-        _write_bytes(wd / "embeddings.npy", buf.getvalue())
-        _write_json(info, {"key": key, "model": config.EMBED_MODEL, "dim": config.EMBED_DIM, "n": len(items)})
+        _save_embeddings(wd, vectors, key)
         ran.append("embed")
 
-    if st is not None:
-        st.upsert(store.DocRecord(doc_id, doc["filename"], doc["n_pages"], contract, items, vectors))
-    return Report(doc_id, doc["filename"], doc["n_pages"], len(items), ran, llm.call_count() - calls_before,
+    indexed = False
+    if st is not None:  # a no-op (and no generation bump) when the index already holds exactly this document
+        indexed = st.upsert(store.DocRecord(doc_id, doc["filename"], doc["n_pages"], contract, items, vectors))
+    return Report(doc_id, doc["filename"], doc["n_pages"], len(items), ran, indexed, llm.call_count() - calls_before,
                   time.perf_counter() - started)
 
 
@@ -192,17 +219,18 @@ def ingest(paths: list[str | Path], st: store.Store | None = None, work: str | P
 
 def load_record(wd: Path) -> store.DocRecord:
     """A work directory -> DocRecord, with no model call. Raises IncompleteError if something is missing or stale."""
-    needed = ["doc.json", "items.json", "meta.json", "embeddings.npy", "embeddings.json"]
+    needed = ["doc.json", "items.json", "meta.json", "embeddings.npz"]
     missing = [n for n in needed if not (wd / n).exists()]
     if missing:
         raise IncompleteError(f"missing {', '.join(missing)}; run ingest on the source file")
     doc = _read_json(wd / "doc.json")
     items = [Item.model_validate(d) for d in _read_json(wd / "items.json")]
-    if _read_json(wd / "embeddings.json").get("key") != _embed_key(items):
+    vectors, key = _load_embeddings(wd)
+    if key != _embed_key(items):
         raise IncompleteError("embeddings are stale (model, dimension or texts changed); run ingest on the source file")
     return store.DocRecord(
         doc["id"], doc["filename"], doc["n_pages"], ContractMeta.model_validate(_read_json(wd / "meta.json")),
-        items, np.load(wd / "embeddings.npy"),
+        items, vectors,
     )
 
 
@@ -241,7 +269,7 @@ if __name__ == "__main__":
     reports, failures = ingest(args, st)
     for r in reports:
         print(f"  {r.doc_id}  {r.n_items:>4} items  {r.n_pages:>3} pages  {r.seconds:5.1f}s  {r.llm_calls:>3} calls  "
-              f"{', '.join(r.ran) or 'cached'}  | {r.filename}")
+              f"{', '.join(r.ran + (['index'] if r.indexed else [])) or 'cached'}  | {r.filename}")
     for f, error in failures:
         print(f"  FAILED {f}: {error}")
     print(f"{len(reports)} ingested, {len(failures)} failed, {llm.call_count() - calls_before} model calls "
