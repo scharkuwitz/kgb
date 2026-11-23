@@ -10,6 +10,7 @@ Probes (these call the API and cost a fraction of a cent):
 
 import base64
 import functools
+import threading
 from typing import TypeVar
 
 import numpy as np
@@ -35,11 +36,28 @@ def client():
     return OpenAI(max_retries=5, timeout=120)
 
 
+_calls = 0
+_calls_lock = threading.Lock()
+
+
+def call_count() -> int:
+    """API requests made by this process so far (answers and embedding batches); lets callers report
+    how many calls a step really made, e.g. to show that a cached re-run made none."""
+    return _calls
+
+
+def _count_call() -> None:
+    global _calls
+    with _calls_lock:
+        _calls += 1
+
+
 def _data_url(image: bytes, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(image).decode()}"
 
 
 def _call(content: list[dict], schema: type[T], model: str) -> T:
+    _count_call()
     response = client().responses.parse(
         model=model,
         input=[{"role": "user", "content": content}],
@@ -97,6 +115,7 @@ def embed(texts: list[str]) -> np.ndarray:
     rows = []
     for start in range(0, len(texts), EMBED_BATCH):
         batch = [t.strip() or " " for t in texts[start : start + EMBED_BATCH]]  # empty input is rejected
+        _count_call()
         response = client().embeddings.create(model=config.EMBED_MODEL, input=batch, dimensions=config.EMBED_DIM)
         rows += [d.embedding for d in sorted(response.data, key=lambda d: d.index)]
     return np.asarray(rows, dtype=np.float32)
