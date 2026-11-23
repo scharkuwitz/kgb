@@ -110,6 +110,8 @@ class Hit(BaseModel):
     spec: str | None = None
     unit_price: float | None = None
     currency: str | None = None
+    doc_id: str | None = None
+    filename: str | None = None
     supplier: str | None = None
     contract_no: str | None = None
     valid_to: str | None = None

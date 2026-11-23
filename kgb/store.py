@@ -304,8 +304,9 @@ class Store:
                 marks = ",".join("?" * len(ids))
                 for row in con.execute(
                     "SELECT i.id, i.name, i.code, i.brand, i.category, i.spec, i.unit_price, i.currency, i.page,"
-                    " c.supplier, c.contract_no, c.valid_to"
-                    f" FROM items i LEFT JOIN contracts c ON c.doc_id = i.doc_id WHERE i.id IN ({marks})",
+                    " c.supplier, c.contract_no, c.valid_to, d.id, d.filename"
+                    " FROM items i JOIN documents d ON d.id = i.doc_id LEFT JOIN contracts c ON c.doc_id = i.doc_id"
+                    f" WHERE i.id IN ({marks})",
                     ids,
                 ):
                     found[row[0]] = row
@@ -314,10 +315,10 @@ class Store:
             row = found.get(item_id)
             if row is None:  # removed by a concurrent write between search and lookup
                 continue
-            _, name, code, brand, category, spec, price, currency, page, supplier, contract_no, valid_to = row
+            _, name, code, brand, category, spec, price, currency, page, supplier, contract_no, valid_to, doc_id, filename = row
             out.append(Hit(
                 item_id=item_id, score=score, name=name, code=code, brand=brand, category=category, spec=spec,
-                unit_price=price, currency=currency, supplier=supplier, contract_no=contract_no, valid_to=valid_to,
+                unit_price=price, currency=currency, doc_id=doc_id, filename=filename, supplier=supplier, contract_no=contract_no, valid_to=valid_to,
                 expired=None if not valid_to else valid_to < today_iso, page=page,
             ))
         return out
