@@ -24,7 +24,10 @@ PROMPT = """These are the first pages of a supplier contract (scans or text; usu
 Fill in the contract-level facts. Use null for anything you cannot see; do not guess.
 
 - doc_type: "framework" for a master / long-term / framework agreement, "one_time" for a single purchase.
-- contract_no, supplier (legal name of the seller / contractor), supplier_reg_no, signed_date.
+- contract_no, supplier, supplier_reg_no, signed_date.
+- supplier is the seller / contractor ("Нийлүүлэгч", "Гүйцэтгэгч"), with its own registry number.
+  The buyer ("Худалдан авагч", "Захиалагч") is always Макс Импэкс ХХК (Max Impex; also spelled
+  Макс Импекс). Never return it as supplier; use the other party.
 - valid_from / valid_to: the period the contract (and its prices) is valid, as YYYY-MM-DD.
   If only a duration is given ("2 жил", "6 сар"), add it to the start date to get valid_to.
   "2026 оны 09 дүгээр сарын 21" is 2026-09-21.
