@@ -140,25 +140,31 @@ class Store:
         self._snap: _Snapshot | None = None
         with closing(self._connect()) as con:
             con.execute("PRAGMA journal_mode=WAL")
-            self._migrate(con)
-            con.executescript(SCHEMA)
+            if self._create_schema(con):
+                warnings.warn("the index used an older layout and was emptied; run `python -m kgb.ingest --reindex`",
+                              RuntimeWarning, stacklevel=2)
 
     @staticmethod
-    def _migrate(con: sqlite3.Connection) -> None:
-        """An index written by an older layout is dropped, not converted: `ingest --reindex` refills it from
-        the work folders without model calls. The generation is bumped so running readers reload."""
+    def _create_schema(con: sqlite3.Connection) -> bool:
+        """Create the tables, in one transaction. An index written by an older layout is dropped and recreated in
+        that same transaction (readers in other processes see the old or the new layout, never a gap): it is
+        disposable, and `ingest --reindex` refills it from the work folders without model calls. The generation is
+        bumped so running readers reload. Returns True when an old layout was emptied."""
         con.execute("BEGIN IMMEDIATE")
         try:
             has_state = con.execute("SELECT 1 FROM sqlite_master WHERE name = 'state'").fetchone()
             row = has_state and con.execute("SELECT value FROM state WHERE key = 'schema'").fetchone()
-            if has_state and (row is None or row[0] != SCHEMA_VERSION):
+            emptied = bool(has_state) and (row is None or row[0] != SCHEMA_VERSION)
+            if emptied:
                 for table in _TABLES:
                     con.execute(f"DROP TABLE IF EXISTS {table}")
                 con.execute("DELETE FROM state WHERE key = 'schema'")
                 con.execute("UPDATE state SET value = value + 1 WHERE key = 'generation'")
-                warnings.warn("the index used an older layout and was emptied; run `python -m kgb.ingest --reindex`",
-                              RuntimeWarning, stacklevel=3)
+            for statement in SCHEMA.split(";"):  # not executescript(): that commits on its own
+                if statement.strip():
+                    con.execute(statement)
             con.execute("COMMIT")
+            return emptied
         except BaseException:
             con.execute("ROLLBACK")
             raise

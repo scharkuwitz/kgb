@@ -1,6 +1,7 @@
 """Offline tests for kgb.ingest: a real csv file, a real work directory and index, every model call faked."""
 
 import hashlib
+import json
 import os
 import threading
 
@@ -240,3 +241,36 @@ def test_concurrent_writers_of_one_artifact_do_not_collide(tmp_path):
     assert errors == []
     assert target.read_bytes() in {payload(n, i) for n in range(8) for i in range(40)}  # one complete payload, never a mix
     assert [p.name for p in tmp_path.iterdir()] == ["items.json"]
+
+
+def _make_legacy(wd):
+    """Turn a work folder into the earlier layout: embeddings.npy + embeddings.json instead of embeddings.npz."""
+    vectors, key = ingest._load_embeddings(wd)
+    (wd / "embeddings.npz").unlink()
+    np.save(wd / "embeddings.npy", vectors)
+    (wd / "embeddings.json").write_text(json.dumps({"key": key}), encoding="utf-8")
+    return vectors
+
+
+def test_old_embedding_files_are_converted_so_reindex_and_ingest_need_no_model_call(env, fakes, tmp_path):
+    src, work, st = env
+    wd = work / ingest.ingest_file(src, st, work).doc_id
+    vectors = _make_legacy(wd)
+    calls = (fakes.triage, fakes.extract, fakes.meta, fakes.embed)
+    fresh = store.Store(tmp_path / "fresh.sqlite")
+    assert ingest.reindex(fresh, work) == (1, [])
+    assert (fakes.triage, fakes.extract, fakes.meta, fakes.embed) == calls
+    assert (wd / "embeddings.npz").exists() and not (wd / "embeddings.npy").exists() and not (wd / "embeddings.json").exists()
+    assert np.array_equal(ingest._load_embeddings(wd)[0], vectors)
+    _make_legacy(wd)
+    assert ingest.ingest_file(src, st, work).ran == []  # ingest accepts the old files too
+    assert fakes.embed == calls[3]
+
+
+def test_old_embedding_files_with_a_stale_key_are_still_reported_stale(env, fakes):
+    src, work, st = env
+    wd = work / ingest.ingest_file(src, st, work).doc_id
+    _make_legacy(wd)
+    (wd / "embeddings.json").write_text('{"key": "old"}', encoding="utf-8")
+    n, skipped = ingest.reindex(st, work)
+    assert n == 0 and "stale" in skipped[0]

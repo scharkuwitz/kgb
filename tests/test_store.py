@@ -207,3 +207,38 @@ def test_an_index_with_an_older_layout_is_emptied_not_misread(tmp_path):
     assert st.counts()["documents"] == 0 and st.counts()["generation"] == 6
     assert st.upsert(record()) is True
     assert Store(path).counts()["items"] == 3  # a second open of the new layout keeps its data
+
+
+def test_readers_never_see_missing_tables_while_an_old_index_is_migrated(tmp_path):
+    path = tmp_path / "old.sqlite"
+    with closing(sqlite3.connect(path)) as con:
+        con.executescript(
+            "PRAGMA journal_mode=WAL;"
+            "CREATE TABLE documents (id TEXT PRIMARY KEY, filename TEXT NOT NULL, n_pages INTEGER NOT NULL);"
+            "CREATE TABLE state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);"
+            "INSERT INTO state VALUES ('generation', 0);"
+        )
+    errors, stop = [], threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            try:
+                with closing(sqlite3.connect(path, timeout=30)) as con:
+                    con.execute("SELECT COUNT(*) FROM documents").fetchone()
+                    con.execute("SELECT COUNT(*) FROM state").fetchone()
+            except sqlite3.OperationalError as e:
+                if "no such table" in str(e):
+                    errors.append(e)
+                    return
+
+    threads = [threading.Thread(target=reader) for _ in range(4)]
+    for t in threads:
+        t.start()
+    try:
+        with pytest.warns(RuntimeWarning):
+            Store(path)
+    finally:
+        stop.set()
+        for t in threads:
+            t.join()
+    assert errors == []

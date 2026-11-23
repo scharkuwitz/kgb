@@ -114,7 +114,22 @@ def _save_embeddings(wd: Path, vectors: np.ndarray, key: str) -> None:
     _write_bytes(wd / "embeddings.npz", buf.getvalue())
 
 
+def _has_embeddings(wd: Path) -> bool:
+    return (wd / "embeddings.npz").exists() or ((wd / "embeddings.npy").exists() and (wd / "embeddings.json").exists())
+
+
 def _load_embeddings(wd: Path) -> tuple[np.ndarray, str]:
+    """(vectors, key). A work folder from before the single-file format (embeddings.npy + embeddings.json) is
+    converted on first use, so existing caches keep working without new model calls."""
+    if not (wd / "embeddings.npz").exists():
+        vectors = np.load(wd / "embeddings.npy")
+        key = str(_read_json(wd / "embeddings.json")["key"])
+        if vectors.ndim != 2:
+            raise IncompleteError(f"old embeddings.npy has shape {vectors.shape}")
+        _save_embeddings(wd, vectors, key)
+        (wd / "embeddings.npy").unlink()
+        (wd / "embeddings.json").unlink()
+        return vectors, key
     with np.load(wd / "embeddings.npz") as data:
         return data["vectors"], str(data["key"])
 
@@ -186,7 +201,7 @@ def ingest_file(path: str | Path, st: store.Store | None = None, work: str | Pat
     contract = ContractMeta.model_validate(_read_json(wd / "meta.json"))
 
     key = _embed_key(items)
-    vectors, stored_key = _load_embeddings(wd) if (wd / "embeddings.npz").exists() else (None, None)
+    vectors, stored_key = _load_embeddings(wd) if _has_embeddings(wd) else (None, None)
     if stored_key != key:
         vectors = llm.embed([embed_text(i) for i in items])
         _save_embeddings(wd, vectors, key)
@@ -219,8 +234,9 @@ def ingest(paths: list[str | Path], st: store.Store | None = None, work: str | P
 
 def load_record(wd: Path) -> store.DocRecord:
     """A work directory -> DocRecord, with no model call. Raises IncompleteError if something is missing or stale."""
-    needed = ["doc.json", "items.json", "meta.json", "embeddings.npz"]
-    missing = [n for n in needed if not (wd / n).exists()]
+    missing = [n for n in ("doc.json", "items.json", "meta.json") if not (wd / n).exists()]
+    if not _has_embeddings(wd):
+        missing.append("embeddings.npz")
     if missing:
         raise IncompleteError(f"missing {', '.join(missing)}; run ingest on the source file")
     doc = _read_json(wd / "doc.json")
