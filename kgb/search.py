@@ -21,7 +21,7 @@ Search is read-only and thread-safe (see `kgb.store`): one `Store` can serve man
 `ingest` writes. The only network call is the query embedding.
 
 Probe:
-    uv run python -m kgb.search                              # API: the acceptance queries, ranks in all three modes
+    uv run python -m kgb.search                              # API: the acceptance queries, ranks in all three modes (with --mode: that mode only)
     uv run python -m kgb.search "муфт 20" "ус халаагч" [-k 10] [--mode semantic] [--active]   # API: your own queries
     uv run python -m kgb.search --keyword "муфт 20"          # no API: keyword side only (= --mode keyword)
 """
@@ -205,6 +205,7 @@ if __name__ == "__main__":
         del args[at : at + 2]
         return value
 
+    mode_given = "--keyword" in args or "--mode" in args
     mode = "keyword" if "--keyword" in args else option("--mode", "hybrid")
     k = int(option("-k", "10"))
     active_only = "--active" in args
@@ -222,17 +223,21 @@ if __name__ == "__main__":
             print(f"\n{query!r}  mode={mode}{'  active only' if active_only else ''}  keyword terms: {terms(query)}")
             _print_hits(hits)
     else:
-        # the acceptance queries in every mode; hybrid and semantic embed the same texts, so embed once and reuse
-        from kgb import llm
-
+        # the acceptance queries: only the requested mode when one is given (keyword then needs no API), else every
+        # mode; hybrid and semantic embed the same texts, so embed once and reuse
         queries = [q for q, _, _ in EXPECTED]
-        vectors = dict(zip(queries, llm.embed(queries)))
+        run_modes = (mode,) if mode_given else MODES
+        cached = None
+        if any(m != "keyword" for m in run_modes):
+            from kgb import llm
 
-        def cached(texts):
-            return np.stack([vectors[t] for t in texts])
+            vectors = dict(zip(queries, llm.embed(queries)))
+
+            def cached(texts):
+                return np.stack([vectors[t] for t in texts])
 
         table: dict[str, list[int | None]] = {}
-        for m in MODES:
+        for m in run_modes:
             batch = search_many(queries, 10, store, embed=cached, mode=m)
             table[m] = [_rank_of(hits, marker, code) for (_, marker, code), hits in zip(EXPECTED, batch)]
             if m == mode:
@@ -243,8 +248,8 @@ if __name__ == "__main__":
                   f"{'first at rank ' + str(rank) if rank else 'not in the top 10'}   keyword terms: {terms(query)}")
             _print_hits(hits[:5])
         print(f"\nrank of the expected contract in the top 10, per mode (- = missing)")
-        print(f"  {'query':<26}" + "".join(f"{m:>10}" for m in MODES))
+        print(f"  {'query':<26}" + "".join(f"{m:>10}" for m in run_modes))
         for n, (query, marker, code) in enumerate(EXPECTED):
-            print(f"  {query[:26]:<26}" + "".join(f"{table[m][n] or '-':>10}" for m in MODES))
-        print("  " + " " * 26 + "".join(f"{sum(r is not None for r in table[m]):>8}/{len(EXPECTED)}" for m in MODES))
+            print(f"  {query[:26]:<26}" + "".join(f"{table[m][n] or '-':>10}" for m in run_modes))
+        print("  " + " " * 26 + "".join(f"{sum(r is not None for r in table[m]):>8}/{len(EXPECTED)}" for m in run_modes))
         sys.exit(0 if all(table[mode]) else 1)
