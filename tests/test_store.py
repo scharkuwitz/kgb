@@ -242,3 +242,29 @@ def test_readers_never_see_missing_tables_while_an_old_index_is_migrated(tmp_pat
         for t in threads:
             t.join()
     assert errors == []
+
+
+def test_item_and_document_lookups(st):
+    st.upsert(record())
+    (item_id, _), = st.fts_search('"сандал"')
+    item = st.item(item_id, today=date(2026, 6, 1))
+    assert (item.name, item.spec, item.seq, item.supplier, item.expired, item.vat_included) == \
+        ("Оффисын сандал", "хар", 1, "Нийлүүлэгч ХХК", False, None)
+    assert st.item(10**9) is None
+    doc = st.document("aaa", today=date(2026, 6, 1))
+    assert (doc.id, doc.n_items, doc.contract_no, doc.expired) == ("aaa", 3, "M-1", False)
+    assert [i.code for i in doc.items] == ["G1", "S2", "619"]
+    assert st.document("nope") is None
+    assert st.documents(today=date(2100, 1, 1))[0]["expired"] is True
+
+
+def test_export_is_a_complete_searchable_copy(st, tmp_path):
+    st.upsert(record())
+    st.upsert(record("bbb", supplier="Өөр ХХК"))
+    dest = st.export(tmp_path / "snap" / "copy.sqlite")
+    copy = Store(dest)
+    assert copy.counts() | {"generation": 0} == st.counts() | {"generation": 0}
+    assert [i for i, _ in copy.fts_search('"сандал"')] == [i for i, _ in st.fts_search('"сандал"')]
+    assert copy.warm() == 6
+    with pytest.raises(FileExistsError):
+        st.export(dest)  # never overwrites

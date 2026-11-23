@@ -1,6 +1,8 @@
 """Documents -> work directory -> index. Every stage writes an artifact and skips itself when it exists.
 
     report = ingest_file("contract.pdf", store)     # Report: stages that ran, LLM calls made
+    report = ingest_pdf(pdf_bytes, "contract.pdf", store)   # one uploaded PDF (what POST /contracts runs)
+    reports, failures = ingest(["data/contracts"], store, jobs=3)   # a folder, 3 files at a time
     n, skipped = reindex(store)                     # rebuild the index from the work directories, no model calls
 
 Work directory `config.WORK/<sha12>/` (sha12 = first 12 hex digits of the file's SHA-256; the same file
@@ -21,17 +23,30 @@ What gets embedded: `Item.search_text` only (the normalized description; falls b
 Prices, units and contract fields are columns, not meaning.
 
 Probe (the first run calls the API; a repeat run does not):
-    uv run python -m kgb.ingest "data/contracts"                    # every supported file in the folder
+    uv run python -m kgb.ingest "data/contracts" [--jobs 3]         # every supported file in the folder
     uv run python -m kgb.ingest "data/contracts/[Sample] Contract #D.pdf"
+    uv run python -m kgb.ingest --pdf "data/contracts/[Sample] Contract #D.pdf"   # exactly what POST /contracts does
     uv run python -m kgb.ingest --reindex                           # drop and rebuild the index from data/work
+    uv run python -m kgb.ingest --export data/kgb-snapshot.sqlite   # consistent single-file copy of the index
+
+One-time bulk load (about 150 contracts): run the folder ingest with --jobs 3 until it reports 0 failed (a
+re-run only redoes what is missing), check with `python -m kgb.search`, then --export a snapshot for the
+server and back up data/work/ (the OCR and embedding cache; --reindex rebuilds any index from it for free).
+The server needs the same KGB_EMBED_MODEL and KGB_EMBED_DIM as the ingest, and OPENAI_API_KEY for queries.
+
+With jobs > 1 (or concurrent uploads) `Report.llm_calls` also counts calls made for the other documents in
+flight at the time; `Report.ran` is exact.
 """
 
 import hashlib
 import io
 import json
 import os
+import shutil
 import tempfile
+import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,6 +70,11 @@ class Report:
     indexed: bool = False  # the index changed (False when it already held exactly this document)
     llm_calls: int = 0
     seconds: float = 0.0
+
+    @property
+    def cached(self) -> bool:
+        """Every stage came from the work directory: nothing was read by a model or embedded."""
+        return not self.ran
 
 
 class IncompleteError(ValueError):
@@ -142,8 +162,14 @@ def _load_embeddings(wd: Path) -> tuple[np.ndarray, str]:
                 except (FileNotFoundError, PermissionError):
                     pass  # already removed by another converter, or held open by one: harmless, the npz wins
             return vectors, key
-    with np.load(npz) as data:
-        return data["vectors"], str(data["key"])
+    for attempt in range(REPLACE_TRIES):
+        try:
+            with np.load(npz) as data:
+                return data["vectors"], str(data["key"])
+        except PermissionError:  # Windows: another converter is replacing the file right now
+            if attempt == REPLACE_TRIES - 1:
+                raise
+            time.sleep(0.01 * (attempt + 1))
 
 
 def _embed_key(items: list[Item]) -> str:
@@ -157,16 +183,70 @@ def _embed_key(items: list[Item]) -> str:
 
 def ingest_file(path: str | Path, st: store.Store | None = None, work: str | Path | None = None) -> Report:
     """Run every stage that has no artifact yet, then (when `st` is given) upsert the document into the index."""
-    path, work = Path(path), Path(work or config.WORK)
+    path = Path(path)
+    return _ingest(sha12(path), path.name, path.suffix.lower(), path.read_bytes, st, work)
+
+
+class RejectedFile(ValueError):
+    """A file that is not accepted. Nothing was spent on it and no work folder is left behind.
+    `reason`: "type" (not a PDF), "size" (over KGB_MAX_UPLOAD_MB), "empty", or "unreadable" (cannot be rendered)."""
+
+    def __init__(self, message: str, reason: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+def check_pdf(data: bytes, filename: str) -> None:
+    """Raise RejectedFile unless `data` is one PDF of acceptable size named *.pdf."""
+    if Path(filename).suffix.lower() != ".pdf":
+        raise RejectedFile(f"only .pdf files are accepted, not {filename!r}", "type")
+    if not data:
+        raise RejectedFile("the file is empty", "empty")
+    if len(data) > config.MAX_UPLOAD_MB * 1024 * 1024:
+        raise RejectedFile(f"the file is {len(data) / 1024 / 1024:.1f} MB; the limit is {config.MAX_UPLOAD_MB} MB (KGB_MAX_UPLOAD_MB)", "size")
+    if not data[:1024].lstrip().startswith(b"%PDF-"):
+        raise RejectedFile("the content is not a PDF (no %PDF- header)", "type")
+
+
+def ingest_pdf(data: bytes, filename: str, st: store.Store | None = None, work: str | Path | None = None) -> Report:
+    """One PDF, given as bytes (an upload), through the whole pipeline into the index. This is what both
+    `POST /contracts` and `python -m kgb.ingest --pdf <file>` run.
+
+    Only this document is touched: no folder scan, no reindex, other documents keep their artifacts and rows.
+    The same bytes again (under any name) hit the cache: no model call, no page rendering, and the index is not
+    written (`Report.cached` is True). Raises RejectedFile before anything is written if it is not a PDF."""
+    check_pdf(data, filename)
+    doc_id = hashlib.sha256(data).hexdigest()[:12]
+    return _ingest(doc_id, Path(filename).name, ".pdf", lambda: data, st, work)
+
+
+_doc_locks: dict[str, threading.Lock] = {}
+_doc_locks_guard = threading.Lock()
+
+
+def _doc_lock(doc_id: str) -> threading.Lock:
+    """One lock per document, so two simultaneous requests for the same file run the pipeline once: the second
+    waits and then finds every artifact cached. Different documents still run in parallel."""
+    with _doc_locks_guard:
+        return _doc_locks.setdefault(doc_id, threading.Lock())
+
+
+def _ingest(doc_id: str, filename: str, suffix: str, read: Callable[[], bytes], st: store.Store | None,
+            work: str | Path | None) -> Report:
+    with _doc_lock(doc_id):
+        return _run_stages(doc_id, filename, suffix, read, st, Path(work or config.WORK))
+
+
+def _run_stages(doc_id: str, filename: str, suffix: str, read: Callable[[], bytes], st: store.Store | None,
+                work: Path) -> Report:
     started, calls_before = time.perf_counter(), llm.call_count()
-    doc_id = sha12(path)
     wd = work / doc_id
     (wd / "items").mkdir(parents=True, exist_ok=True)
     ran: list[str] = []
 
-    source = wd / f"source{path.suffix.lower()}"
+    source = wd / f"source{suffix}"
     if not source.exists():
-        _write_bytes(source, path.read_bytes())
+        _write_bytes(source, read())
 
     loaded: list = []
 
@@ -176,7 +256,13 @@ def ingest_file(path: str | Path, st: store.Store | None = None, work: str | Pat
         return loaded[0]
 
     if not (wd / "doc.json").exists():
-        _write_json(wd / "doc.json", {"id": doc_id, "filename": path.name, "n_pages": len(pages())})
+        try:
+            n_pages = len(pages())
+        except Exception as e:
+            if not (wd / "triage.json").exists() and not any((wd / "items").iterdir()):
+                shutil.rmtree(wd, ignore_errors=True)  # nothing learnt from it: leave no half folder for reindex to report
+            raise RejectedFile(f"cannot read {filename}: {type(e).__name__}: {e}", "unreadable") from e
+        _write_json(wd / "doc.json", {"id": doc_id, "filename": filename, "n_pages": n_pages})
     doc = _read_json(wd / "doc.json")
 
     if not (wd / "triage.json").exists():
@@ -226,18 +312,29 @@ def ingest_file(path: str | Path, st: store.Store | None = None, work: str | Pat
                   time.perf_counter() - started)
 
 
-def ingest(paths: list[str | Path], st: store.Store | None = None, work: str | Path | None = None):
-    """Ingest files and folders (one level; unsupported file types are skipped).
-    Returns (reports, failures) where failures is a list of (path, error text)."""
+def ingest(paths: list[str | Path], st: store.Store | None = None, work: str | Path | None = None, jobs: int = 1,
+           on_done: Callable[[Report], None] | None = None):
+    """Ingest files and folders (one level; unsupported file types are skipped), `jobs` files at a time
+    (each file also extracts its pages on up to config.WORKERS threads). `on_done` is called as each file
+    finishes. Returns (reports, failures) in input order; failures is a list of (path, error text)."""
     files: list[Path] = []
     for p in map(Path, paths):
         files += sorted(f for f in p.iterdir() if f.is_file() and f.suffix.lower() in load.LOADERS) if p.is_dir() else [p]
-    reports, failures = [], []
-    for f in files:
+    outcome: dict[int, Report | str] = {}
+
+    def one(n: int, f: Path) -> None:
         try:
-            reports.append(ingest_file(f, st, work))
+            outcome[n] = report = ingest_file(f, st, work)
         except Exception as e:  # one bad file must not stop a batch; its finished stages are kept for the retry
-            failures.append((f, f"{type(e).__name__}: {e}"))
+            outcome[n] = f"{type(e).__name__}: {e}"
+            return
+        if on_done:
+            on_done(report)
+
+    with ThreadPoolExecutor(max_workers=max(1, min(jobs, len(files) or 1))) as pool:
+        list(pool.map(one, range(len(files)), files))
+    reports = [outcome[n] for n in range(len(files)) if isinstance(outcome[n], Report)]
+    failures = [(f, outcome[n]) for n, f in enumerate(files) if not isinstance(outcome[n], Report)]
     return reports, failures
 
 
@@ -278,6 +375,11 @@ def reindex(st: store.Store, work: str | Path | None = None) -> tuple[int, list[
     return st.replace_all(records()), skipped
 
 
+def _print_report(r: Report) -> None:
+    print(f"  {r.doc_id}  {r.n_items:>4} items  {r.n_pages:>3} pages  {r.seconds:5.1f}s  {r.llm_calls:>3} calls  "
+          f"{', '.join(r.ran + (['index'] if r.indexed else [])) or 'cached'}  | {r.filename}", flush=True)
+
+
 if __name__ == "__main__":
     import sys
 
@@ -285,6 +387,10 @@ if __name__ == "__main__":
     if not args:
         sys.exit(__doc__)
     st = store.Store()
+    if args[0] == "--export" and len(args) == 2:
+        dest = st.export(args[1])
+        print(f"exported {st.counts()} to {dest.resolve()} ({dest.stat().st_size / 1024 / 1024:.1f} MB)")
+        sys.exit(0)
     if args == ["--reindex"]:
         started = time.perf_counter()
         n, skipped = reindex(st)
@@ -293,11 +399,24 @@ if __name__ == "__main__":
             print("  skipped", line)
         print("counts", st.counts())
         sys.exit(1 if skipped else 0)
+    if args[0] == "--pdf" and len(args) == 2:
+        path = Path(args[1])
+        print(f"one PDF: {path} ({path.stat().st_size / 1024:.0f} KB), same code path as POST /contracts")
+        try:
+            report = ingest_pdf(path.read_bytes(), path.name, st)
+        except RejectedFile as e:
+            sys.exit(f"rejected: {e}")
+        _print_report(report)
+        print(f"cached={report.cached} indexed={report.indexed} work dir: {(config.WORK / report.doc_id).resolve()}")
+        print("counts", st.counts())
+        sys.exit(0)
+    jobs = 1
+    if "--jobs" in args:
+        at = args.index("--jobs")
+        jobs = int(args[at + 1])
+        del args[at : at + 2]
     started, calls_before = time.perf_counter(), llm.call_count()
-    reports, failures = ingest(args, st)
-    for r in reports:
-        print(f"  {r.doc_id}  {r.n_items:>4} items  {r.n_pages:>3} pages  {r.seconds:5.1f}s  {r.llm_calls:>3} calls  "
-              f"{', '.join(r.ran + (['index'] if r.indexed else [])) or 'cached'}  | {r.filename}")
+    reports, failures = ingest(args, st, jobs=jobs, on_done=_print_report)
     for f, error in failures:
         print(f"  FAILED {f}: {error}")
     print(f"{len(reports)} ingested, {len(failures)} failed, {llm.call_count() - calls_before} model calls "

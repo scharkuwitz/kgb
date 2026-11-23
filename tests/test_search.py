@@ -194,3 +194,39 @@ def test_first_concurrent_searches_build_one_store(tmp_path, monkeypatch):
         t.join()
     assert len(built) == 1 and len({id(s) for s in got}) == 1 and len(got) == 8
     assert search._store(tmp_path / "other.sqlite") is not got[0]  # a different file gets its own Store
+
+
+# ---- modes and filters --------------------------------------------------------
+
+
+def test_keyword_mode_makes_no_embedding_call(st):
+    def boom(texts):
+        raise AssertionError("keyword mode must not embed")
+
+    hits = search.search("сандал", k=5, store=st, embed=boom, mode="keyword")
+    assert {h.filename for h in hits} == {"chairs.pdf"}
+    assert search_many(["гутал", "сандал"], store=st, embed=boom, mode="keyword")[1][0].filename == "chairs.pdf"
+
+
+def test_semantic_mode_ignores_the_keywords(st):
+    # the words say chairs, the embedder says shoes: semantic follows the vectors, keyword the words
+    embed = embedder({"сандал": 0})
+    assert {h.filename for h in search.search("сандал", k=2, store=st, embed=embed, mode="semantic")} == {"shoes.pdf"}
+    assert {h.filename for h in search.search("сандал", k=2, store=st, embed=embed, mode="keyword")} == {"chairs.pdf"}
+    top = search.search("сандал", k=1, store=st, embed=embed, mode="semantic")[0]
+    assert top.score == pytest.approx(1.0)  # cosine
+
+
+def test_active_only_drops_expired_but_still_fills_k(st):
+    embed = embedder({"муфт": 2})
+    every = search.search("муфт", k=6, store=st, embed=embed, today=date(2026, 6, 1))
+    assert every[0].expired is True  # the two pipes (expired) rank first
+    active = search.search("муфт", k=3, store=st, embed=embed, today=date(2026, 6, 1), active_only=True)
+    assert len(active) == 3 and all(h.expired is False for h in active)
+
+
+def test_unknown_mode_and_k_cap(st):
+    with pytest.raises(ValueError):
+        search.search("гутал", store=st, embed=embedder({}), mode="fuzzy")
+    assert len(search.search("гутал", k=10_000, store=st, embed=embedder({}))) == 6  # capped at POOL, index has 6
+    assert search.search("гутал", k=0, store=st, embed=embedder({})) == []

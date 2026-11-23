@@ -333,3 +333,74 @@ def test_many_threads_converting_the_same_old_folder_all_succeed(env, fakes):
     assert errors == [] and len(results) == 8
     assert all(np.array_equal(r, expected) for r in results)
     assert (wd / "embeddings.npz").exists()
+
+
+# ---- one uploaded PDF, and folders in parallel -----------------------------------------
+
+
+def _pdf(pages=1, colour="white"):
+    import io
+
+    from PIL import Image
+
+    images = [Image.new("RGB", (200, 300), colour) for _ in range(pages)]
+    buf = io.BytesIO()
+    images[0].save(buf, "PDF", save_all=True, append_images=images[1:])
+    return buf.getvalue()
+
+
+@pytest.fixture
+def pdf_fakes(fakes, monkeypatch):
+    """PDF pages are images, so the csv-reading fake extractor is replaced by one item per page."""
+    def fake_extract_page(page, **_):
+        fakes.extract += 1
+        return PageItems(items=[Item(name=f"Бараа {page.no}", search_text=f"бараа {page.no}", unit_price=1.0)])
+
+    monkeypatch.setattr(triage, "triage", lambda pages, **_: [PageLabel(page=p.no, label="items", reason="") for p in pages])
+    monkeypatch.setattr(extract, "extract_page", fake_extract_page)
+    return fakes
+
+
+def test_ingest_pdf_is_the_same_document_as_ingest_file(pdf_fakes, tmp_path):
+    work, st = tmp_path / "work", store.Store(tmp_path / "kgb.sqlite")
+    data = _pdf(2)
+    first = ingest.ingest_pdf(data, "upload.pdf", st, work)
+    assert (first.ran, first.n_items, first.cached, first.indexed) == (["triage", "extract:2", "meta", "embed"], 2, False, True)
+    path = tmp_path / "same.pdf"
+    path.write_bytes(data)
+    again = ingest.ingest_file(path, st, work)  # same bytes from disk: same id, all cached
+    assert (again.doc_id, again.cached, again.indexed, again.filename) == (first.doc_id, True, False, "upload.pdf")
+    assert pdf_fakes.load == 1  # the cached run did not even render the PDF
+
+
+def test_check_pdf_refuses_what_is_not_a_pdf(fakes, tmp_path):
+    for name, data, reason in [("a.txt", _pdf(), "type"), ("a.pdf", b"PK\x03\x04", "type"), ("a.pdf", b"", "empty")]:
+        with pytest.raises(ingest.RejectedFile) as e:
+            ingest.ingest_pdf(data, name, None, tmp_path / "work")
+        assert e.value.reason == reason
+    assert not (tmp_path / "work").exists()
+
+
+def test_concurrent_uploads_of_one_pdf_run_the_pipeline_once(pdf_fakes, tmp_path):
+    work, st = tmp_path / "work", store.Store(tmp_path / "kgb.sqlite")
+    data, reports = _pdf(1), []
+    threads = [threading.Thread(target=lambda: reports.append(ingest.ingest_pdf(data, "x.pdf", st, work))) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(reports) == 4 and sum(not r.cached for r in reports) == 1
+    assert (pdf_fakes.extract, pdf_fakes.meta, pdf_fakes.embed) == (1, 1, 1)
+
+
+def test_folder_ingest_with_jobs_keeps_input_order(pdf_fakes, tmp_path):
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    for n, colour in enumerate(["white", "black", "red", "blue"]):
+        (folder / f"{n}.pdf").write_bytes(_pdf(1, colour))
+    (folder / "bad.pdf").write_bytes(b"%PDF-1.4 broken")
+    st, done = store.Store(tmp_path / "kgb.sqlite"), []
+    reports, failures = ingest.ingest([folder], st, tmp_path / "work", jobs=3, on_done=done.append)
+    assert [r.filename for r in reports] == ["0.pdf", "1.pdf", "2.pdf", "3.pdf"]
+    assert [f.name for f, _ in failures] == ["bad.pdf"] and "RejectedFile" in failures[0][1]
+    assert len(done) == 4 and st.counts()["documents"] == 4

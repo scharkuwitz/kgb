@@ -9,13 +9,16 @@ The only module that knows the storage engine. Everything else sees plain data:
     st.fts_search('"муфт"', k)                      # [(item_id, score)], keyword (FTS5 trigram, substring match)
     st.vector_search(query_vec, k)                  # [(item_id, cosine)], brute force over a cached matrix
     st.hits(pairs)                                  # [(item_id, score)] -> list[Hit], with contract facts
+    st.item(item_id), st.document(doc_id)           # ItemDetail / ContractDetail (with its items), or None
     st.counts(), st.documents()
+    st.export("snapshot.sqlite")                    # consistent single-file copy (VACUUM INTO), safe while in use
+    st.warm()                                       # load the vector matrix now (server start)
 
 The index is disposable: `data/work/<sha12>/` holds the source of truth, and `kgb.ingest --reindex`
 rebuilds this file from it without any model call. To move to another engine (Qdrant, Weaviate),
 reimplement this class; callers keep the same calls.
 
-Concurrency (the search side will be served by an API later; ingestion is rare):
+Concurrency (`kgb.api` serves searches from a thread pool while uploads or a CLI ingest write):
 - WAL journal: readers never block the writer and never see a half-written document.
 - Every call opens its own short-lived connection, so threads (or an async server's thread pool) never
   share one. Reads are `query_only`.
@@ -44,7 +47,7 @@ from pathlib import Path
 import numpy as np
 
 from kgb import config
-from kgb.schema import ContractMeta, Hit, Item
+from kgb.schema import ContractDetail, ContractMeta, Hit, Item, ItemDetail, ItemRecord
 
 SCHEMA_VERSION = 2  # bump when the tables change; an index with another version is dropped (it is disposable)
 
@@ -124,6 +127,38 @@ def fingerprint(record: DocRecord) -> str:
         digest.update(b"")
     digest.update(np.ascontiguousarray(record.vectors, dtype="<f4").tobytes())
     return digest.hexdigest()
+
+
+# One item with its contract and document, the shape every item read starts from.
+_HIT_SELECT = (
+    "SELECT i.id AS item_id, i.seq, i.name, i.code, i.brand, i.category, i.spec, i.unit, i.unit_price, i.list_price,"
+    " i.currency, i.vat_included, i.page, i.search_text, c.supplier, c.contract_no, c.valid_from, c.valid_to,"
+    " c.terms_note, d.id AS doc_id, d.filename"
+    " FROM items i JOIN documents d ON d.id = i.doc_id LEFT JOIN contracts c ON c.doc_id = i.doc_id"
+)
+
+# One document with its contract facts and item count.
+_DOC_SELECT = (
+    "SELECT d.id, d.filename, d.n_pages, c.doc_type, c.contract_no, c.supplier, c.supplier_reg_no, c.signed_date,"
+    " c.valid_from, c.valid_to, c.terms_note, (SELECT COUNT(*) FROM items i WHERE i.doc_id = d.id) AS n_items"
+    " FROM documents d LEFT JOIN contracts c ON c.doc_id = d.id"
+)
+
+
+def _record(row: sqlite3.Row, today_iso: str) -> dict:
+    """The ItemRecord fields of a `_HIT_SELECT` row."""
+    valid_to, vat = row["valid_to"], row["vat_included"]
+    return dict(
+        item_id=row["item_id"], name=row["name"], code=row["code"], brand=row["brand"], category=row["category"],
+        spec=row["spec"], unit=row["unit"], unit_price=row["unit_price"], list_price=row["list_price"],
+        currency=row["currency"], vat_included=None if vat is None else bool(vat), doc_id=row["doc_id"],
+        filename=row["filename"], supplier=row["supplier"], contract_no=row["contract_no"],
+        valid_from=row["valid_from"], valid_to=valid_to, expired=_expired(valid_to, today_iso), page=row["page"],
+    )
+
+
+def _expired(valid_to: str | None, today_iso: str) -> bool | None:
+    return None if not valid_to else valid_to < today_iso
 
 
 def _unit(rows: np.ndarray) -> np.ndarray:
@@ -299,29 +334,61 @@ class Store:
         today_iso = (today or date.today()).isoformat()
         found: dict[int, tuple] = {}
         with self._reader() as con:
+            con.row_factory = sqlite3.Row
             for start in range(0, len(pairs), _IN_CHUNK):
                 ids = [i for i, _ in pairs[start : start + _IN_CHUNK]]
                 marks = ",".join("?" * len(ids))
-                for row in con.execute(
-                    "SELECT i.id, i.name, i.code, i.brand, i.category, i.spec, i.unit_price, i.currency, i.page,"
-                    " c.supplier, c.contract_no, c.valid_to, d.id, d.filename"
-                    " FROM items i JOIN documents d ON d.id = i.doc_id LEFT JOIN contracts c ON c.doc_id = i.doc_id"
-                    f" WHERE i.id IN ({marks})",
-                    ids,
-                ):
-                    found[row[0]] = row
+                for row in con.execute(f"{_HIT_SELECT} WHERE i.id IN ({marks})", ids):
+                    found[row["item_id"]] = row
         out = []
         for item_id, score in pairs:
             row = found.get(item_id)
             if row is None:  # removed by a concurrent write between search and lookup
                 continue
-            _, name, code, brand, category, spec, price, currency, page, supplier, contract_no, valid_to, doc_id, filename = row
-            out.append(Hit(
-                item_id=item_id, score=score, name=name, code=code, brand=brand, category=category, spec=spec,
-                unit_price=price, currency=currency, doc_id=doc_id, filename=filename, supplier=supplier, contract_no=contract_no, valid_to=valid_to,
-                expired=None if not valid_to else valid_to < today_iso, page=page,
-            ))
+            out.append(Hit(**_record(row, today_iso), score=score))
         return out
+
+    def item(self, item_id: int, today: date | None = None) -> ItemDetail | None:
+        """Everything about one item, or None when no such item exists (any more)."""
+        with self._reader() as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute(f"{_HIT_SELECT} WHERE i.id = ?", (item_id,)).fetchone()
+        if row is None:
+            return None
+        return ItemDetail(**_record(row, (today or date.today()).isoformat()), seq=row["seq"],
+                          search_text=row["search_text"], terms_note=row["terms_note"])
+
+    def document(self, doc_id: str, today: date | None = None) -> ContractDetail | None:
+        """One document: its contract facts and its items in document order. None when it is not indexed."""
+        with self._reader() as con:
+            con.row_factory = sqlite3.Row
+            con.execute("BEGIN")  # the document and its items from one consistent read
+            try:
+                head = con.execute(f"{_DOC_SELECT} WHERE d.id = ?", (doc_id,)).fetchone()
+                rows = con.execute(f"{_HIT_SELECT} WHERE i.doc_id = ? ORDER BY i.seq", (doc_id,)).fetchall() if head else []
+            finally:
+                con.execute("COMMIT")
+        if head is None:
+            return None
+        today_iso = (today or date.today()).isoformat()
+        return ContractDetail(**dict(head), expired=_expired(head["valid_to"], today_iso),
+                              items=[ItemRecord(**_record(r, today_iso)) for r in rows])
+
+    def export(self, dest: str | Path) -> Path:
+        """Write a consistent single-file copy of the index (`VACUUM INTO`): includes what still sits in the
+        WAL file, which a plain file copy can miss. Safe while others read or write. Refuses to overwrite."""
+        dest = Path(dest)
+        if dest.exists():
+            raise FileExistsError(f"{dest} already exists")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with closing(self._connect()) as con:
+            con.execute("VACUUM INTO ?", (str(dest),))
+        return dest
+
+    def warm(self) -> int:
+        """Load the vector matrix now (a server calls this at start, so the first query is not slow).
+        Returns the number of vectors."""
+        return len(self._snapshot().ids)
 
     def counts(self) -> dict[str, int]:
         with self._reader() as con:
@@ -333,16 +400,14 @@ class Store:
                 "generation": self._generation(con),
             }
 
-    def documents(self) -> list[dict]:
-        """One row per document, oldest id first, with the contract facts and its item count."""
+    def documents(self, today: date | None = None) -> list[dict]:
+        """One row per document, ordered by id, with the contract facts, its item count and whether the contract
+        has expired (the fields of `ContractSummary`)."""
+        today_iso = (today or date.today()).isoformat()
         with self._reader() as con:
             con.row_factory = sqlite3.Row
-            rows = con.execute(
-                "SELECT d.id, d.filename, d.n_pages, c.doc_type, c.contract_no, c.supplier, c.valid_from, c.valid_to,"
-                " (SELECT COUNT(*) FROM items i WHERE i.doc_id = d.id) AS n_items"
-                " FROM documents d LEFT JOIN contracts c ON c.doc_id = d.id ORDER BY d.id"
-            ).fetchall()
-        return [dict(r) for r in rows]
+            rows = con.execute(f"{_DOC_SELECT} ORDER BY d.id").fetchall()
+        return [dict(r) | {"expired": _expired(r["valid_to"], today_iso)} for r in rows]
 
     # ---- vector snapshot -------------------------------------------------------
 
