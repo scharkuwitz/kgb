@@ -24,7 +24,8 @@ All settings are `KGB_*` environment variables (or lines in `.env`): models, dat
 1. **Load:** every file becomes a list of pages: scans and PDFs as images, office files as text.
 2. **Triage:** one cheap low-resolution pass labels each page, so only pages with items are read closely.
 3. **Extract:** item pages are read in parallel at full resolution into structured entries (name, code, spec, price, VAT, page). Section headers, merged cells and VAT notes are carried across page breaks, and garbled readings are retried.
-4. **Store and search** *(next)*: entries are indexed for keyword and meaning-based search.
+4. **Contract facts:** one cheap call over the first key-terms pages gives parties, validity dates and a short note (rough on purpose; items matter most).
+5. **Store and search** *(next)*: entries are indexed for keyword and meaning-based search.
 
 ## Usage
 
@@ -36,6 +37,7 @@ uv run python -m kgb.llm ask "data/contracts/doc.pdf" 6         # label one page
 uv run python -m kgb.llm embed "first text" "second text"       # embedding shape and similarity (API call)
 uv run python -m kgb.triage "data/contracts/doc.pdf"            # label every page, list the ones to extract (API call)
 uv run python -m kgb.extract "data/contracts/doc.pdf" [pages]   # items as a table + JSON in data/probe/extract (API calls)
+uv run python -m kgb.meta "data/contracts/doc.pdf" [pages]      # parties and validity dates from the key-terms pages (API calls)
 ```
 
 Put source documents in `data/contracts/` (git-ignored). Supported: `pdf`, `png`, `jpg`, `tif`, `webp`, `docx`, `xlsx`, `csv`.
@@ -56,10 +58,11 @@ uv run pytest -q    # offline: no API key or network needed
 | `kgb/llm.py` | The only OpenAI-facing module: structured answers and embeddings |
 | `kgb/triage.py` | Cheap first pass: labels each page as items / key terms / other |
 | `kgb/extract.py` | Item pages → structured items; carries categories, merged cells and VAT across pages |
+| `kgb/meta.py` | Key-terms pages → contract facts (parties, validity dates, short note) |
 
 ## Status
 
-Early development, built in small steps that can each be checked on their own. Done: configuration, document loading, model access, page triage, item extraction. Next: document facts, storage, search.
+Early development, built in small steps that can each be checked on their own. Done: configuration, document loading, model access, page triage, item extraction, contract facts. Next: storage, search.
 
 ## License
 

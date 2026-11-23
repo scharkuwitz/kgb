@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-KGB is a lightweight knowledge base of supplier contracts (mostly scanned Mongolian PDFs, plus docx/xlsx/images). The question it answers: "Is this item already covered by a contract? With whom, at what price, and is the contract still valid?" It is built in small milestones (M0–M8), each checkable on its own. Done so far: config, load, llm, triage, extract (M0–M4). Not yet written: `extract_meta`, `store`, `ingest`, `search`, `check`, `cli`. Do not assume those modules exist.
+KGB is a lightweight knowledge base of supplier contracts (mostly scanned Mongolian PDFs, plus docx/xlsx/images). The question it answers: "Is this item already covered by a contract? With whom, at what price, and is the contract still valid?" It is built in small milestones (M0–M8), each checkable on its own. Done so far: config, load, llm, triage, extract, meta (M0–M5). Not yet written: `store`, `ingest`, `search`, `check`, `cli`. Do not assume those modules exist.
 
 ## Commands
 
@@ -27,15 +27,16 @@ uv run python -m kgb.llm ask "<file>" <page_no>                  # API: label on
 uv run python -m kgb.llm embed "text one" "text two"             # API: embedding shape/similarity
 uv run python -m kgb.triage "<file>"                             # API: label all pages
 uv run python -m kgb.extract "<file>" [pages] [--split N] [--detail high|original]   # API: items table + JSON in data/probe/extract
+uv run python -m kgb.meta "<file>" [pages]                       # API: parties + validity dates; checks samples A-D
 ```
 
 Source documents go in `data/contracts/` (git-ignored; real sample files named `[Sample] Contract #A..D.pdf`). The triage probe checks results against the expected item pages of those four samples (`triage.EXPECTED`).
 
 ## Architecture
 
-Pipeline: `load → triage → extract → fill_forward → (extract_meta) → (embed) → (store) → (search → check)`. Parenthesised steps are planned, not built; the approved design is in the auto-memory notes (`kgb-design-doc`, `kgb-milestones`).
+Pipeline: `load → triage → extract → fill_forward → extract_meta → (embed) → (store) → (search → check)`. Parenthesised steps are planned, not built; the approved design is in the auto-memory notes (`kgb-design-doc`, `kgb-milestones`).
 
-Dependency graph (acyclic): `config`, `schema` ← everything; `load` ← schema; `llm` ← config, schema; `triage`, `extract` ← llm, load, schema.
+Dependency graph (acyclic): `config`, `schema` ← everything; `load` ← schema; `llm` ← config, schema; `triage`, `extract` ← llm, load, schema; `meta` ← llm, load.shrink, schema.
 
 Seams that must be preserved:
 - **Only `kgb/llm.py` imports `openai`.** It uses the Responses API (`responses.parse(text_format=...)`) with strict structured outputs, `store=False`, and a cached thread-safe client. Pydantic models in `schema.py` double as the LLM output schemas.
@@ -49,6 +50,7 @@ Behaviour that spans files and is easy to break:
 - **Glitch guard in `extract_page`:** a result containing mixed-script words (e.g. "дагaldah") is retried with the same settings, then at the other image `detail` level; the cleanest result is kept.
 - **`EXTRACT_DETAIL` defaults to `original`** (reads VAT notes like "Нөат-эй" correctly, ~10% more tokens than `high`). `split=2` (overlapping strips) exists but was found unnecessary.
 - `Item.unit_price` is the price payable after discount; `list_price` is pre-discount. `Item.search_text` is a normalized Mongolian Cyrillic description meant for embedding/FTS; queries are typed in Mongolian Cyrillic.
+- **Contract metadata is deliberately low-effort** (`meta.extract_meta`): one cheap call over ≤3 key-terms pages, no retries or verification. Only the validity dates matter downstream (expiry check); invalid dates are dropped to `None`. Don't spend more tokens or code on it unless asked.
 - Strict structured outputs require every field; in LLM-facing models only use `X | None = None` defaults.
 
 ## Conventions

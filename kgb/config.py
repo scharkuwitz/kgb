@@ -42,6 +42,7 @@ WORK = Path(_env("KGB_WORK", DATA / "work"))  # per-document artifacts = source 
 TRIAGE_MODEL = _env("KGB_TRIAGE_MODEL", "gpt-6-luna")
 EXTRACT_MODEL = _env("KGB_EXTRACT_MODEL", "gpt-6-luna")
 JUDGE_MODEL = _env("KGB_JUDGE_MODEL", "gpt-6-luna")
+META_MODEL = _env("KGB_META_MODEL", TRIAGE_MODEL)  # contract dates/parties: low stakes, so the cheap model
 EMBED_MODEL = _env("KGB_EMBED_MODEL", "text-embedding-3-small")
 EMBED_DIM = int(_env("KGB_EMBED_DIM", 512))
 
@@ -51,6 +52,7 @@ WORKERS = int(_env("KGB_WORKERS", 8))  # parallel LLM calls
 # Page images
 RENDER_PX = int(_env("KGB_RENDER_PX", 2000))  # long side of rendered pages (extraction)
 TRIAGE_PX = int(_env("KGB_TRIAGE_PX", 768))  # long side of thumbnails (triage)
+META_PX = int(_env("KGB_META_PX", 1280))  # long side of key-terms pages (dates need more than triage)
 # Image detail for extraction. "original" reads small print better than "high" (e.g. VAT notes) for ~10% more input tokens.
 EXTRACT_DETAIL = _env("KGB_EXTRACT_DETAIL", "original")
 
